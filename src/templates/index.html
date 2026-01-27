@@ -291,6 +291,14 @@
             color: #888;
         }
 
+        .time-remaining {
+            text-align: center;
+            margin-top: 8px;
+            font-size: 0.9rem;
+            color: #4a90d9;
+            font-weight: 500;
+        }
+
         .log-panel {
             grid-column: 1 / -1;
         }
@@ -563,6 +571,7 @@
                     <div class="progress-bar-container">
                         <div class="progress-bar" id="progress-bar"></div>
                     </div>
+                    <div id="time-remaining" class="time-remaining">Estimated Time Remaining: --:--:--</div>
                 </div>
 
                 <div class="buttons-row">
@@ -765,6 +774,13 @@
             const percent = Math.min(100, (currentStep / totalSteps) * 100);
             document.getElementById('progress-bar').style.width = `${percent}%`;
             document.getElementById('progress-percent').textContent = `${percent.toFixed(1)}%`;
+            
+            // Update time remaining
+            if (metrics.time_remaining) {
+                document.getElementById('time-remaining').textContent = `Estimated Time Remaining: ${metrics.time_remaining}`;
+            } else {
+                document.getElementById('time-remaining').textContent = 'Estimated Time Remaining: --:--:--';
+            }
 
             // Update training state
             if (status === 'completed' || status === 'idle' || status.startsWith('error')) {

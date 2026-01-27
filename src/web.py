@@ -387,6 +387,7 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
         emit_metrics()
         
         global_step = start_step
+        start_time = time.time()
         
         for epoch in range(start_epoch, config.num_epochs):
             if training_state.should_stop:
@@ -453,6 +454,20 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
                     
                     global_step += 1
                     avg_loss = total_loss / num_batches
+                    
+                    # Calculate time remaining
+                    elapsed = time.time() - start_time
+                    steps_done_session = global_step - start_step
+                    if steps_done_session > 0:
+                        steps_per_sec = steps_done_session / elapsed
+                        remaining_steps = training_state.metrics["total_steps"] - global_step
+                        remaining_seconds = remaining_steps / steps_per_sec
+                        
+                        # Format as HH:MM:SS
+                        m, s = divmod(int(remaining_seconds), 60)
+                        h, m = divmod(m, 60)
+                        time_str = f"{h:02d}:{m:02d}:{s:02d}"
+                        training_state.metrics["time_remaining"] = time_str
                     
                     training_state.metrics["step"] = global_step
                     training_state.metrics["train_loss"] = loss.item() * config.gradient_accumulation_steps
