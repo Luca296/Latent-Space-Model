@@ -47,6 +47,9 @@ class Config:
     do_sample: bool = True
     top_p: float = 0.9
     top_k: int = 50
+
+    # UI settings
+    use_tui: bool = True
     
     # Dataset
     dataset_name: str = "knkarthick/samsum"

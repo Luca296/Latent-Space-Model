@@ -142,6 +142,12 @@ def parse_args():
         action="store_true",
         help="Disable mixed precision training"
     )
+
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Disable the Rich TUI for training"
+    )
     
     return parser.parse_args()
 
@@ -166,6 +172,8 @@ def main():
         config.device = args.device
     if args.no_fp16:
         config.use_fp16 = False
+    if args.no_tui:
+        config.use_tui = False
     
     # Override generation parameters
     if args.max_length is not None:
