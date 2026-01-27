@@ -25,8 +25,8 @@ class Config:
     max_target_len: int = 128
     
     # Model names
-    modernbert_model: str = "answerdotai/ModernBERT-base"
-    gpt2_model: str = "gpt2"
+    modernbert_model: str = "answerdotai/ModernBERT-base"  # Base is the standard/small option
+    gpt2_model: str = "gpt2"  # This is GPT-2 Small (117M parameters)
     
     # Training settings
     num_epochs: int = 5
@@ -49,7 +49,7 @@ class Config:
     top_k: int = 50
     
     # Dataset
-    dataset_name: str = "samsum"
+    dataset_name: str = "knkarthick/samsum"
     train_split: str = "train"
     validation_split: str = "validation"
     test_split: str = "test"

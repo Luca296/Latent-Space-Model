@@ -16,6 +16,7 @@ class SAMSumDataset(Dataset):
     def __init__(
         self,
         split: str = "train",
+        dataset_name: str = "knkarthick/samsum",
         modernbert_tokenizer_name: str = "answerdotai/ModernBERT-base",
         gpt2_tokenizer_name: str = "gpt2",
         max_seq_len: int = 256,
@@ -35,8 +36,8 @@ class SAMSumDataset(Dataset):
             self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
         
         # Load SAMSum dataset
-        print(f"Loading SAMSum {split} split...")
-        dataset = load_dataset("samsum", split=split)
+        print(f"Loading {dataset_name} {split} split...")
+        dataset = load_dataset(dataset_name, split=split)
         
         # Limit samples if specified
         if max_samples is not None:
@@ -124,6 +125,7 @@ def create_dataloaders(
     # Create datasets
     train_dataset = SAMSumDataset(
         split=config.train_split,
+        dataset_name=config.dataset_name,
         modernbert_tokenizer_name=config.modernbert_model,
         gpt2_tokenizer_name=config.gpt2_model,
         max_seq_len=config.max_seq_len,
@@ -133,6 +135,7 @@ def create_dataloaders(
     
     val_dataset = SAMSumDataset(
         split=config.validation_split,
+        dataset_name=config.dataset_name,
         modernbert_tokenizer_name=config.modernbert_model,
         gpt2_tokenizer_name=config.gpt2_model,
         max_seq_len=config.max_seq_len,
@@ -175,6 +178,7 @@ def create_test_dataloader(config, test_samples: int = None) -> DataLoader:
     """
     test_dataset = SAMSumDataset(
         split=config.test_split,
+        dataset_name=config.dataset_name,
         modernbert_tokenizer_name=config.modernbert_model,
         gpt2_tokenizer_name=config.gpt2_model,
         max_seq_len=config.max_seq_len,
