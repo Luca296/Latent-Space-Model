@@ -35,8 +35,9 @@ class LatentSpaceInference:
         print("Loading model...")
         self.model = LatentSpaceModel(config).to(device)
         
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=device)
+        # Load checkpoint (trusted local file)
+        torch.serialization.add_safe_globals([Config])
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         self.model.load_state_dict(checkpoint if "model_state_dict" not in checkpoint else checkpoint["model_state_dict"])
         self.model.eval()
         print(f"Model loaded from {model_path}")

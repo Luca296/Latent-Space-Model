@@ -277,8 +277,9 @@ def create_app():
             
             device = torch.device(config.device if torch.cuda.is_available() else "cpu")
             
-            # Load best_model checkpoint
-            checkpoint = torch.load(best_model_path, map_location=device)
+            # Load best_model checkpoint (trusted local file)
+            torch.serialization.add_safe_globals([Config])
+            checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
             
             # Try to get config from best_model.pt
             if isinstance(checkpoint, dict) and "config" in checkpoint:
@@ -287,7 +288,7 @@ def create_app():
                 # Fallback: look for config in regular checkpoints
                 checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_step_*.pt"))
                 if checkpoint_files:
-                    regular_checkpoint = torch.load(checkpoint_files[-1], map_location=device)
+                    regular_checkpoint = torch.load(checkpoint_files[-1], map_location=device, weights_only=False)
                     if isinstance(regular_checkpoint, dict) and "config" in regular_checkpoint:
                         config = regular_checkpoint["config"]
             
