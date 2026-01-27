@@ -36,7 +36,7 @@ def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor,
     
     # Flatten for cross-entropy
     batch_size, seq_len, vocab_size = logits.shape
-    logits_flat = logits.view(-1, vocab_size)
+    logits_flat = logits.reshape(-1, vocab_size)
     target_ids_flat = target_ids_shifted.reshape(-1)
     target_mask_flat = target_mask_shifted.reshape(-1)
     

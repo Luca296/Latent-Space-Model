@@ -6,6 +6,21 @@ Supports training and inference modes via command-line arguments.
 
 import argparse
 import torch
+import sys
+
+# Suppress broken torchvision if necessary
+try:
+    import torchvision
+    # If it imported, check if it's actually working by accessing a member
+    _ = torchvision.ops.nms
+except (ImportError, RuntimeError, AttributeError):
+    import sys
+    # Setting to None makes future 'import torchvision' raise ImportError
+    sys.modules["torchvision"] = None
+    sys.modules["torchvision.ops"] = None
+    sys.modules["torchvision.transforms"] = None
+    print("Warning: torchvision is broken or missing. Masking it to allow execution.")
+
 from pathlib import Path
 
 from src.config import Config

@@ -226,12 +226,12 @@ class LatentSpaceModel(nn.Module):
         target_attention = target_attention_mask[:, :-1]
         combined_attention = torch.cat([prefix_attention, target_attention], dim=1)
         
-        # Run GPT-2 (no gradient for frozen backbone)
-        with torch.no_grad():
-            outputs = self.gpt2(
-                inputs_embeds=input_embeds,
-                attention_mask=combined_attention
-            )
+        # Run GPT-2. Even though GPT-2 is frozen, we need gradients to flow 
+        # back through it to the prefix embeddings.
+        outputs = self.gpt2(
+            inputs_embeds=input_embeds,
+            attention_mask=combined_attention
+        )
         
         # Get logits for target positions (skip prefix)
         logits = outputs.logits[:, self.config.prefix_len:, :]  # [B, T-1, vocab_size]
