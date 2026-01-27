@@ -318,6 +318,95 @@
         .hidden {
             display: none;
         }
+
+        /* Inference Section Styles */
+        .inference-panel {
+            margin-top: 0;
+        }
+
+        .inference-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            background: #0f0f23;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+
+        .inference-content {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .inference-input-section label,
+        .inference-output-section label {
+            display: block;
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 8px;
+        }
+
+        .inference-input-section textarea {
+            width: 100%;
+            background: #0f0f23;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 12px;
+            color: #fff;
+            font-size: 0.9rem;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        .inference-input-section textarea:focus {
+            outline: none;
+            border-color: #4a90d9;
+        }
+
+        .inference-input-section textarea:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .inference-params {
+            background: #0f0f23;
+            border-radius: 6px;
+            padding: 16px;
+        }
+
+        .inference-output-section {
+            margin-top: 8px;
+        }
+
+        .inference-output {
+            background: #0f0f23;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 16px;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 0.9rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .inference-output .placeholder {
+            color: #666;
+            font-style: italic;
+        }
+
+        .inference-output.loading {
+            color: #888;
+        }
+
+        .inference-output.error {
+            color: #d94a4a;
+        }
     </style>
 </head>
 <body>
@@ -489,6 +578,60 @@
                 <h3 class="panel-title">Log</h3>
                 <div class="log-container" id="log-container">
                     <div class="log-entry info">[System] Ready to start training</div>
+                </div>
+            </div>
+
+            <!-- Inference Panel -->
+            <div class="panel inference-panel" style="grid-column: 1 / -1;">
+                <h3 class="panel-title">Inference</h3>
+                
+                <div class="inference-status" id="inference-status">
+                    <span class="status-dot idle" id="inference-status-dot"></span>
+                    <span id="inference-status-text">Checking model availability...</span>
+                </div>
+
+                <div class="inference-content">
+                    <div class="inference-input-section">
+                        <label for="inference-input">Input Text</label>
+                        <textarea id="inference-input" rows="4" placeholder="Enter your input text here..."></textarea>
+                    </div>
+
+                    <div class="inference-params">
+                        <div class="config-grid">
+                            <div class="config-field">
+                                <label for="inf-temperature">Temperature</label>
+                                <input type="number" id="inf-temperature" value="0.7" step="0.1" min="0.1" max="2.0">
+                            </div>
+                            <div class="config-field">
+                                <label for="inf-max-length">Max Length</label>
+                                <input type="number" id="inf-max-length" value="128" min="1" max="512">
+                            </div>
+                            <div class="config-field">
+                                <label for="inf-top-p">Top P</label>
+                                <input type="number" id="inf-top-p" value="0.9" step="0.05" min="0" max="1">
+                            </div>
+                            <div class="config-field">
+                                <label for="inf-top-k">Top K</label>
+                                <input type="number" id="inf-top-k" value="50" min="1" max="100">
+                            </div>
+                        </div>
+                        <div class="config-field checkbox-field" style="margin-top: 10px;">
+                            <input type="checkbox" id="inf-do-sample" checked>
+                            <label for="inf-do-sample">Use Sampling</label>
+                        </div>
+                    </div>
+
+                    <div class="buttons-row">
+                        <button id="btn-generate" class="btn-primary" disabled>Generate</button>
+                        <button id="btn-clear-inference" class="btn-secondary">Clear</button>
+                    </div>
+
+                    <div class="inference-output-section">
+                        <label>Model Output</label>
+                        <div class="inference-output" id="inference-output">
+                            <span class="placeholder">Output will appear here...</span>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -765,8 +908,104 @@
             addLog('Configuration reset to defaults', 'info');
         });
 
+        // Inference functionality
+        let inferenceAvailable = false;
+        let isGenerating = false;
+
+        async function checkInferenceStatus() {
+            try {
+                const response = await fetch('/api/inference/status');
+                const data = await response.json();
+                inferenceAvailable = data.available;
+                
+                const statusDot = document.getElementById('inference-status-dot');
+                const statusText = document.getElementById('inference-status-text');
+                const btnGenerate = document.getElementById('btn-generate');
+                
+                if (inferenceAvailable) {
+                    statusDot.className = 'status-dot completed';
+                    statusText.textContent = 'Model available (best_model.pt)';
+                    btnGenerate.disabled = false;
+                } else {
+                    statusDot.className = 'status-dot idle';
+                    statusText.textContent = 'No trained model found. Train a model first.';
+                    btnGenerate.disabled = true;
+                }
+            } catch (error) {
+                console.error('Failed to check inference status:', error);
+            }
+        }
+
+        function updateInferenceUI(generating) {
+            isGenerating = generating;
+            const btnGenerate = document.getElementById('btn-generate');
+            const textarea = document.getElementById('inference-input');
+            
+            btnGenerate.disabled = generating || !inferenceAvailable;
+            btnGenerate.textContent = generating ? 'Generating...' : 'Generate';
+            textarea.disabled = generating;
+        }
+
+        document.getElementById('btn-generate').addEventListener('click', async () => {
+            const inputText = document.getElementById('inference-input').value.trim();
+            const outputDiv = document.getElementById('inference-output');
+            
+            if (!inputText) {
+                outputDiv.innerHTML = '<span class="placeholder">Please enter some input text.</span>';
+                outputDiv.className = 'inference-output error';
+                return;
+            }
+            
+            updateInferenceUI(true);
+            outputDiv.innerHTML = 'Generating response...';
+            outputDiv.className = 'inference-output loading';
+            
+            try {
+                const response = await fetch('/api/inference/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        input_text: inputText,
+                        temperature: parseFloat(document.getElementById('inf-temperature').value),
+                        max_length: parseInt(document.getElementById('inf-max-length').value),
+                        do_sample: document.getElementById('inf-do-sample').checked,
+                        top_p: parseFloat(document.getElementById('inf-top-p').value),
+                        top_k: parseInt(document.getElementById('inf-top-k').value)
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    outputDiv.textContent = 'Error: ' + data.error;
+                    outputDiv.className = 'inference-output error';
+                    addLog('Inference error: ' + data.error, 'error');
+                } else {
+                    outputDiv.textContent = data.output;
+                    outputDiv.className = 'inference-output';
+                    addLog('Generated response successfully', 'success');
+                }
+            } catch (error) {
+                outputDiv.textContent = 'Error: ' + error.message;
+                outputDiv.className = 'inference-output error';
+                addLog('Inference failed: ' + error.message, 'error');
+            } finally {
+                updateInferenceUI(false);
+            }
+        });
+
+        document.getElementById('btn-clear-inference').addEventListener('click', () => {
+            document.getElementById('inference-input').value = '';
+            document.getElementById('inference-output').innerHTML = '<span class="placeholder">Output will appear here...</span>';
+            document.getElementById('inference-output').className = 'inference-output';
+        });
+
         // Initialize
         loadDefaultConfig();
+        checkInferenceStatus();
+
+        // Periodically check inference status (in case model gets trained)
+        setInterval(checkInferenceStatus, 10000);
 
         // Fetch initial status
         fetch('/api/training/status')

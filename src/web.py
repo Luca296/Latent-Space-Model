@@ -245,6 +245,72 @@ def create_app():
             "metrics": training_state.metrics
         })
     
+    @app.route('/api/inference/status', methods=['GET'])
+    def get_inference_status():
+        """Check if inference is available (best_model.pt exists)."""
+        config = Config()
+        best_model_path = Path(config.checkpoint_dir) / "best_model.pt"
+        return jsonify({
+            "available": best_model_path.exists(),
+            "model_path": str(best_model_path) if best_model_path.exists() else None
+        })
+    
+    @app.route('/api/inference/generate', methods=['POST'])
+    def run_inference():
+        """Run inference on input text."""
+        data = request.get_json() or {}
+        input_text = data.get("input_text", "").strip()
+        
+        if not input_text:
+            return jsonify({"error": "No input text provided"}), 400
+        
+        config = Config()
+        best_model_path = Path(config.checkpoint_dir) / "best_model.pt"
+        
+        if not best_model_path.exists():
+            return jsonify({"error": "No trained model found. Please train a model first."}), 400
+        
+        try:
+            import torch
+            from src.inference import LatentSpaceInference
+            
+            # Get generation parameters from request
+            temperature = data.get("temperature", config.temperature)
+            max_length = data.get("max_length", config.max_generation_length)
+            do_sample = data.get("do_sample", config.do_sample)
+            top_p = data.get("top_p", config.top_p)
+            top_k = data.get("top_k", config.top_k)
+            
+            device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+            
+            # Initialize inference model
+            inference_model = LatentSpaceInference(str(best_model_path), config, device)
+            
+            # Generate response
+            output = inference_model.generate(
+                input_text=input_text,
+                max_length=int(max_length),
+                temperature=float(temperature),
+                do_sample=bool(do_sample),
+                top_p=float(top_p),
+                top_k=int(top_k)
+            )
+            
+            return jsonify({
+                "input": input_text,
+                "output": output,
+                "parameters": {
+                    "temperature": temperature,
+                    "max_length": max_length,
+                    "do_sample": do_sample,
+                    "top_p": top_p,
+                    "top_k": top_k
+                }
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
     return app, socketio
 
 
