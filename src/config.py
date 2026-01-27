@@ -19,7 +19,7 @@ class Config:
     
     # Training hyperparameters
     learning_rate: float = 2e-5
-    batch_size: int = 14
+    batch_size: int = 18
     gradient_accumulation_steps: int = 3
     max_seq_len: int = 512
     max_target_len: int = 256

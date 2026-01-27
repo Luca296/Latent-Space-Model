@@ -25,7 +25,7 @@ The initial 5 epochs are insufficient for convergence. Adjust your training hype
 ## [] 5. Sequential Training Strategy (The "Big Fix")
 Training the encoder compression, middle model, and decoder expansion simultaneously creates too much "co-adaptation" chaos. Use a phased approach:
 
-### [] Phase 1: Align Decoder
+### [X] Phase 1: Align Decoder
 **Goal:** Stabilize the latent-to-text mapping.
 * **Components:** Expansion MLP + Optional GPT-2 LoRA.
 * **Task:** Identity mapping.
