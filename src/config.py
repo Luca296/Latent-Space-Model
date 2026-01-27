@@ -62,4 +62,5 @@ class Config:
     # None = normal training
     # "bypass_middle" = Test B: z_out = z_in (skip middle model)
     # "identity_task" = Test C: Train decoder adapter on identity task
+    # "phase1_decoder" = Phase 1: Align decoder adapter on real text
     test_mode: str = None

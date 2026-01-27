@@ -257,6 +257,9 @@ def validate_tui(model, dataloader, device, config, dashboard):
 def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device) -> bool:
     dashboard = TrainingDashboard(config)
     best_model_saved = False
+    # Ensure epoch progress bar matches total epochs
+    dashboard.progress_group.reset(dashboard.epoch_task)
+    dashboard.progress_group.update(dashboard.epoch_task, total=config.num_epochs, completed=0)
     with Live(dashboard.layout, refresh_per_second=4, screen=True) as live:
         def update_view():
             dashboard.update_display()
@@ -285,7 +288,7 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
                 best_model_saved = True
                 dashboard.log(f"[bold green]New best model saved![/] (Loss: {val_loss:.4f})")
                 
-            dashboard.progress_group.advance(dashboard.epoch_task)
+            dashboard.progress_group.update(dashboard.epoch_task, completed=epoch + 1)
             update_view()
             
         dashboard.log("[bold magenta]Training complete![/]")
@@ -407,6 +410,15 @@ def train(config: Config):
         print("Task: Input='Hello world' -> Output='Hello world'")
         print("If it can't reproduce simple text -> adapter is not aligned")
         print("="*60 + "\n")
+    elif test_mode == 'phase1_decoder':
+        print("\n" + "="*60)
+        print("PHASE 1: ALIGN DECODER (Sequential Training)")
+        print("="*60)
+        print("Goal: Stabilize latent-to-text mapping")
+        print("Freezing: encoder compression MLP, middle model")
+        print("Training: prefix_adapter + prefix_layernorm")
+        print("Task: Real text reconstruction (SAMSum dialogues)")
+        print("="*60 + "\n")
     
     # Create dataloaders based on test mode
     if test_mode == 'identity_task':
@@ -437,6 +449,27 @@ def train(config: Config):
         for param in model.prefix_adapter.parameters():
             param.requires_grad = True
         print("  - Trainable: prefix_adapter (expansion MLP)")
+        print()
+    elif test_mode == 'phase1_decoder':
+        print("\nFreezing components for Phase 1...")
+
+        # Freeze encoder compression MLP
+        for param in model.encoder.compression_mlp.parameters():
+            param.requires_grad = False
+        print("  - Frozen: encoder.compression_mlp")
+
+        # Freeze middle model
+        for param in model.middle_model.parameters():
+            param.requires_grad = False
+        print("  - Frozen: middle_model")
+
+        # Ensure prefix adapter + LayerNorm are trainable
+        for param in model.prefix_adapter.parameters():
+            param.requires_grad = True
+        for param in model.prefix_layernorm.parameters():
+            param.requires_grad = True
+        print("  - Trainable: prefix_adapter (expansion MLP)")
+        print("  - Trainable: prefix_layernorm")
         print()
     
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
