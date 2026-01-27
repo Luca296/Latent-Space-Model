@@ -8,6 +8,7 @@ import os
 import json
 import threading
 import time
+import math
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -337,7 +338,7 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
     from torch.cuda.amp import GradScaler, autocast
     
     from src.models import LatentSpaceModel
-    from src.data import create_dataloaders
+    from src.data import create_dataloaders, create_identity_dataloaders, create_phase1_dataloaders
     from src.train import compute_loss, save_checkpoint
     
     def emit_metrics():
@@ -349,16 +350,38 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
         training_state.metrics["status"] = "loading_data"
         emit_metrics()
         
-        train_loader, val_loader = create_dataloaders(
-            config, 
-            train_samples=config.max_train_samples, 
-            val_samples=1000
-        )
+        if getattr(config, "test_mode", None) == "identity_task":
+            train_loader, val_loader = create_identity_dataloaders(config)
+        elif getattr(config, "test_mode", None) == "phase1_decoder":
+            train_loader, val_loader = create_phase1_dataloaders(
+                config,
+                train_samples=config.max_train_samples,
+                val_samples=1000
+            )
+        else:
+            train_loader, val_loader = create_dataloaders(
+                config,
+                train_samples=config.max_train_samples,
+                val_samples=1000
+            )
         
         training_state.metrics["status"] = "loading_model"
         emit_metrics()
         
         model = LatentSpaceModel(config).to(device)
+
+        # Phase 1 / Identity: freeze encoder + middle, train decoder adapter
+        if getattr(config, "test_mode", None) in {"identity_task", "phase1_decoder"}:
+            for param in model.encoder.compression_mlp.parameters():
+                param.requires_grad = False
+            for param in model.middle_model.parameters():
+                param.requires_grad = False
+            for param in model.prefix_adapter.parameters():
+                param.requires_grad = True
+            # Ensure prefix LayerNorm is trainable in Phase 1
+            if getattr(config, "test_mode", None) == "phase1_decoder":
+                for param in model.prefix_layernorm.parameters():
+                    param.requires_grad = True
         trainable_params_list = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params_list, lr=config.learning_rate, weight_decay=config.weight_decay)
         scaler = GradScaler(enabled=config.use_fp16)
@@ -382,7 +405,8 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
             
             training_state.metrics["best_val_loss"] = best_val_loss if best_val_loss != float('inf') else None
         
-        training_state.metrics["total_steps"] = len(train_loader) * config.num_epochs
+        steps_per_epoch = math.ceil(len(train_loader) / max(1, config.gradient_accumulation_steps))
+        training_state.metrics["total_steps"] = steps_per_epoch * config.num_epochs
         training_state.metrics["status"] = "training"
         emit_metrics()
         

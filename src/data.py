@@ -84,6 +84,79 @@ class SAMSumDataset(Dataset):
         }
 
 
+class SAMSumIdentityDataset(Dataset):
+    """Dataset for identity mapping on SAMSum dialogues (dialogue -> dialogue)."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        dataset_name: str = "knkarthick/samsum",
+        modernbert_tokenizer_name: str = "answerdotai/ModernBERT-base",
+        gpt2_tokenizer_name: str = "gpt2",
+        max_seq_len: int = 256,
+        max_target_len: int = 128,
+        max_samples: int = None
+    ):
+        self.split = split
+        self.max_seq_len = max_seq_len
+        self.max_target_len = max_target_len
+
+        # Load tokenizers
+        self.modernbert_tokenizer = AutoTokenizer.from_pretrained(modernbert_tokenizer_name)
+        self.gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_tokenizer_name)
+
+        # Add pad token to GPT-2 if not present
+        if self.gpt2_tokenizer.pad_token is None:
+            self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
+
+        # Load SAMSum dataset
+        print(f"Loading {dataset_name} {split} split for identity mapping...")
+        dataset = load_dataset(dataset_name, split=split)
+
+        # Limit samples if specified
+        if max_samples is not None:
+            dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+        self.data = dataset
+        print(f"Loaded {len(self.data)} samples from {split} split (identity)")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> dict:
+        """Get a single sample (dialogue -> dialogue)."""
+        item = self.data[idx]
+
+        dialogue = item["dialogue"]
+
+        # Tokenize input (dialogue) with ModernBERT tokenizer
+        input_encoding = self.modernbert_tokenizer(
+            dialogue,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        # Tokenize target (same dialogue) with GPT-2 tokenizer
+        target_encoding = self.gpt2_tokenizer(
+            dialogue,
+            max_length=self.max_target_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids": input_encoding["input_ids"].squeeze(0),
+            "attention_mask": input_encoding["attention_mask"].squeeze(0),
+            "target_ids": target_encoding["input_ids"].squeeze(0),
+            "target_attention_mask": target_encoding["attention_mask"].squeeze(0),
+            "dialogue": dialogue,
+            "summary": dialogue
+        }
+
+
 def collate_fn(batch: list) -> dict:
     """Collate function for DataLoader."""
     # Stack all tensors
@@ -346,4 +419,54 @@ def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
         pin_memory=True if torch.cuda.is_available() else False
     )
     
+    return train_loader, val_loader
+
+
+def create_phase1_dataloaders(
+    config,
+    train_samples: int = None,
+    val_samples: int = None
+) -> tuple[DataLoader, DataLoader]:
+    """
+    Create train and validation dataloaders for Phase 1 decoder alignment.
+    Uses dialogue -> dialogue identity mapping on SAMSum.
+    """
+    train_dataset = SAMSumIdentityDataset(
+        split=config.train_split,
+        dataset_name=config.dataset_name,
+        modernbert_tokenizer_name=config.modernbert_model,
+        gpt2_tokenizer_name=config.gpt2_model,
+        max_seq_len=config.max_seq_len,
+        max_target_len=config.max_target_len,
+        max_samples=train_samples
+    )
+
+    val_dataset = SAMSumIdentityDataset(
+        split=config.validation_split,
+        dataset_name=config.dataset_name,
+        modernbert_tokenizer_name=config.modernbert_model,
+        gpt2_tokenizer_name=config.gpt2_model,
+        max_seq_len=config.max_seq_len,
+        max_target_len=config.max_target_len,
+        max_samples=val_samples
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
     return train_loader, val_loader

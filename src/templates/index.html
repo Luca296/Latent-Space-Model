@@ -455,6 +455,15 @@
                     <h4>Training Parameters</h4>
                     <div class="config-grid">
                         <div class="config-field">
+                            <label for="test_mode">Training Mode</label>
+                            <select id="test_mode">
+                                <option value="">Normal</option>
+                                <option value="phase1_decoder">Phase 1: Align Decoder</option>
+                                <option value="identity_task">Identity Task (Test C)</option>
+                                <option value="bypass_middle">Bypass Middle (Test B)</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
                             <label for="learning_rate">Learning Rate</label>
                             <input type="number" id="learning_rate" value="0.0001" step="0.00001">
                         </div>
@@ -651,7 +660,7 @@
         // Configuration fields
         const configFields = [
             'latent_dim', 'prefix_len', 'middle_hidden_dim', 'middle_layers',
-            'learning_rate', 'batch_size', 'num_epochs', 'gradient_accumulation_steps',
+            'test_mode', 'learning_rate', 'batch_size', 'num_epochs', 'gradient_accumulation_steps',
             'max_seq_len', 'max_target_len', 'warmup_steps', 'weight_decay',
             'max_train_samples', 'save_every', 'device', 'use_fp16'
         ];
@@ -707,7 +716,8 @@
                     if (element.type === 'checkbox') {
                         element.checked = config[field];
                     } else {
-                        element.value = config[field];
+                        const value = (config[field] === null || config[field] === undefined) ? '' : config[field];
+                        element.value = value;
                     }
                 }
             }
@@ -769,9 +779,16 @@
                 metrics.best_val_loss ? metrics.best_val_loss.toFixed(4) : '--';
 
             // Update progress bar
-            const totalSteps = metrics.total_steps || 1;
+            const totalEpochs = metrics.total_epochs || 0;
+            const currentEpoch = metrics.epoch || 0;
+            const totalSteps = metrics.total_steps || 0;
             const currentStep = metrics.step || 0;
-            const percent = Math.min(100, (currentStep / totalSteps) * 100);
+            let percent = 0;
+            if (totalEpochs > 0) {
+                percent = Math.min(100, (currentEpoch / totalEpochs) * 100);
+            } else if (totalSteps > 0) {
+                percent = Math.min(100, (currentStep / totalSteps) * 100);
+            }
             document.getElementById('progress-bar').style.width = `${percent}%`;
             document.getElementById('progress-percent').textContent = `${percent.toFixed(1)}%`;
             

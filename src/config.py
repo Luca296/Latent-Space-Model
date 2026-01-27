@@ -11,7 +11,7 @@ class Config:
     
     # Model dimensions
     latent_dim: int = 256
-    prefix_len: int = 10
+    prefix_len: int = 50
     modernbert_hidden_dim: int = 768
     gpt2_hidden_dim: int = 768
     middle_hidden_dim: int = 512
@@ -19,10 +19,10 @@ class Config:
     
     # Training hyperparameters
     learning_rate: float = 2e-5
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 1
-    max_seq_len: int = 256
-    max_target_len: int = 128
+    batch_size: int = 14
+    gradient_accumulation_steps: int = 3
+    max_seq_len: int = 512
+    max_target_len: int = 256
     
     # Model names
     modernbert_model: str = "answerdotai/ModernBERT-base"  # Base is the standard/small option
