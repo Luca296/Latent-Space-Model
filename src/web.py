@@ -265,7 +265,8 @@ def create_app():
             return jsonify({"error": "No input text provided"}), 400
         
         config = Config()
-        best_model_path = Path(config.checkpoint_dir) / "best_model.pt"
+        checkpoint_dir = Path(config.checkpoint_dir)
+        best_model_path = checkpoint_dir / "best_model.pt"
         
         if not best_model_path.exists():
             return jsonify({"error": "No trained model found. Please train a model first."}), 400
@@ -274,16 +275,30 @@ def create_app():
             import torch
             from src.inference import LatentSpaceInference
             
-            # Get generation parameters from request
+            device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+            
+            # Load best_model checkpoint
+            checkpoint = torch.load(best_model_path, map_location=device)
+            
+            # Try to get config from best_model.pt
+            if isinstance(checkpoint, dict) and "config" in checkpoint:
+                config = checkpoint["config"]
+            else:
+                # Fallback: look for config in regular checkpoints
+                checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_step_*.pt"))
+                if checkpoint_files:
+                    regular_checkpoint = torch.load(checkpoint_files[-1], map_location=device)
+                    if isinstance(regular_checkpoint, dict) and "config" in regular_checkpoint:
+                        config = regular_checkpoint["config"]
+            
+            # Get generation parameters from request (override config defaults)
             temperature = data.get("temperature", config.temperature)
             max_length = data.get("max_length", config.max_generation_length)
             do_sample = data.get("do_sample", config.do_sample)
             top_p = data.get("top_p", config.top_p)
             top_k = data.get("top_k", config.top_k)
             
-            device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-            
-            # Initialize inference model
+            # Initialize inference model with the correct config
             inference_model = LatentSpaceInference(str(best_model_path), config, device)
             
             # Generate response

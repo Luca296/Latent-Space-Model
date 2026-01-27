@@ -278,7 +278,10 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
                 checkpoint_dir = Path(config.checkpoint_dir)
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 best_model_path = checkpoint_dir / "best_model.pt"
-                torch.save(model.state_dict(), best_model_path, _use_new_zipfile_serialization=False)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "config": config
+                }, best_model_path, _use_new_zipfile_serialization=False)
                 best_model_saved = True
                 dashboard.log(f"[bold green]New best model saved![/] (Loss: {val_loss:.4f})")
                 
@@ -367,7 +370,10 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
             checkpoint_dir = Path(config.checkpoint_dir)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             best_model_path = checkpoint_dir / "best_model.pt"
-            torch.save(model.state_dict(), best_model_path, _use_new_zipfile_serialization=False)
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "config": config
+            }, best_model_path, _use_new_zipfile_serialization=False)
             best_model_saved = True
             print(f"Saved best model with val_loss: {val_loss:.4f}")
             
