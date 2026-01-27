@@ -71,44 +71,19 @@ def save_checkpoint(
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
-    temp_path = checkpoint_path.with_suffix(".pt.tmp")
-    
-    try:
-        torch.save({
-            "step": step,
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "config": config
-        }, temp_path)
-        os.replace(temp_path, checkpoint_path)
-    except Exception as exc:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-        print(f"Warning: failed to save checkpoint at step {step}: {exc}")
+    torch.save({
+        "step": step,
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "config": config
+    }, checkpoint_path, _use_new_zipfile_serialization=False)
 
 
-def cleanup_checkpoints(config: Config):
-    """Delete all step checkpoints, keeping only best_model.pt."""
-    checkpoint_dir = Path(config.checkpoint_dir)
-    if not checkpoint_dir.exists():
-        return
-        
-    best_model_path = checkpoint_dir / "best_model.pt"
-    if best_model_path.exists():
-        print("Cleaning up intermediate checkpoints...")
-        for ckpt in checkpoint_dir.glob("checkpoint_step_*.pt"):
-            try:
-                os.remove(ckpt)
-                print(f"Deleted {ckpt.name}")
-            except OSError as e:
-                print(f"Error deleting {ckpt.name}: {e}")
-    else:
-        print("Warning: best_model.pt not found. Keeping all checkpoints.")
+def cleanup_checkpoints(config: Config, best_model_saved: bool):
+    """No-op: keep all checkpoints and best_model.pt."""
+    return
 
 
 # --- TUI Logic ---
@@ -171,7 +146,10 @@ class TrainingDashboard:
         if self.val_loss is not None:
             val_style = "green" if self.val_loss <= self.best_val_loss else "yellow"
             table.add_row("Validation Loss", f"[{val_style}]{self.val_loss:.4f}[/]")
+        if self.best_val_loss != float('inf'):
             table.add_row("Best Val Loss", f"[bold green]{self.best_val_loss:.4f}[/]")
+        else:
+            table.add_row("Best Val Loss", "[dim]N/A[/]")
         return Panel(table, title="Training Metrics", border_style="yellow", box=box.ROUNDED)
 
     def generate_logs_panel(self) -> Panel:
@@ -276,8 +254,9 @@ def validate_tui(model, dataloader, device, config, dashboard):
     dashboard.progress_group.remove_task(val_task)
     return total_loss / num_batches
 
-def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device):
+def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device) -> bool:
     dashboard = TrainingDashboard(config)
+    best_model_saved = False
     with Live(dashboard.layout, refresh_per_second=4, screen=True) as live:
         def update_view():
             dashboard.update_display()
@@ -299,7 +278,8 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
                 checkpoint_dir = Path(config.checkpoint_dir)
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 best_model_path = checkpoint_dir / "best_model.pt"
-                torch.save(model.state_dict(), best_model_path)
+                torch.save(model.state_dict(), best_model_path, _use_new_zipfile_serialization=False)
+                best_model_saved = True
                 dashboard.log(f"[bold green]New best model saved![/] (Loss: {val_loss:.4f})")
                 
             dashboard.progress_group.advance(dashboard.epoch_task)
@@ -307,6 +287,7 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
             
         dashboard.log("[bold magenta]Training complete![/]")
         time.sleep(2)
+    return best_model_saved
 
 
 # --- Simple (No-TUI) Logic ---
@@ -369,9 +350,10 @@ def validate_simple(model, dataloader, device, config):
             num_batches += 1
     return total_loss / num_batches
 
-def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device):
+def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device) -> bool:
     print("Starting training (Simple Mode)...")
     best_val_loss = float("inf")
+    best_model_saved = False
     
     for epoch in range(config.num_epochs):
         train_loss = train_epoch_simple(model, train_loader, optimizer, scaler, device, config, epoch)
@@ -385,10 +367,12 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
             checkpoint_dir = Path(config.checkpoint_dir)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             best_model_path = checkpoint_dir / "best_model.pt"
-            torch.save(model.state_dict(), best_model_path)
+            torch.save(model.state_dict(), best_model_path, _use_new_zipfile_serialization=False)
+            best_model_saved = True
             print(f"Saved best model with val_loss: {val_loss:.4f}")
             
     print(f"Training complete! Best validation loss: {best_val_loss:.4f}")
+    return best_model_saved
 
 
 # --- Main Entry ---
@@ -412,12 +396,12 @@ def train(config: Config):
     scaler = GradScaler(enabled=config.use_fp16)
     
     if config.use_tui:
-        run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device)
+        best_model_saved = run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device)
     else:
-        run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device)
+        best_model_saved = run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device)
 
     # Cleanup logic
-    cleanup_checkpoints(config)
+    cleanup_checkpoints(config, best_model_saved)
 
 
 if __name__ == "__main__":
