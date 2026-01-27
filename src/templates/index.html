@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Latent-Space Model Training</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: #1a1a2e;
+            color: #eaeaea;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            padding: 20px 0 30px;
+            border-bottom: 1px solid #333;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+
+        header p {
+            color: #888;
+            font-size: 0.9rem;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 20px;
+            border: 1px solid #333;
+        }
+
+        .panel-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 16px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #333;
+        }
+
+        .config-section {
+            margin-bottom: 20px;
+        }
+
+        .config-section h4 {
+            font-size: 0.85rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        .config-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .config-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .config-field label {
+            font-size: 0.8rem;
+            color: #aaa;
+        }
+
+        .config-field input, .config-field select {
+            background: #0f0f23;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 8px 10px;
+            color: #fff;
+            font-size: 0.9rem;
+            transition: border-color 0.2s;
+        }
+
+        .config-field input:focus, .config-field select:focus {
+            outline: none;
+            border-color: #4a90d9;
+        }
+
+        .config-field input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .checkbox-field {
+            flex-direction: row;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .checkbox-field input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+        }
+
+        .buttons-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: #4a90d9;
+            color: #fff;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #3a7bc8;
+        }
+
+        .btn-secondary {
+            background: #333;
+            color: #fff;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #444;
+        }
+
+        .btn-danger {
+            background: #d94a4a;
+            color: #fff;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #c83a3a;
+        }
+
+        .btn-warning {
+            background: #d9a54a;
+            color: #fff;
+        }
+
+        .btn-warning:hover:not(:disabled) {
+            background: #c89a3a;
+        }
+
+        .btn-success {
+            background: #4ad94a;
+            color: #fff;
+        }
+
+        .btn-success:hover:not(:disabled) {
+            background: #3ac83a;
+        }
+
+        .status-panel {
+            margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            background: #0f0f23;
+            border-radius: 6px;
+            margin-bottom: 16px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .status-dot.idle { background: #666; }
+        .status-dot.running { background: #4ad94a; animation: pulse 1.5s infinite; }
+        .status-dot.paused { background: #d9a54a; }
+        .status-dot.error { background: #d94a4a; }
+        .status-dot.completed { background: #4a90d9; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .status-text {
+            font-size: 0.9rem;
+            color: #fff;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }
+
+        .metric-card {
+            background: #0f0f23;
+            border-radius: 6px;
+            padding: 12px;
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .metric-value {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .metric-value.highlight {
+            color: #4a90d9;
+        }
+
+        .progress-section {
+            margin-top: 16px;
+        }
+
+        .progress-bar-container {
+            background: #0f0f23;
+            border-radius: 4px;
+            height: 8px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #4a90d9, #4ad98a);
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .progress-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: #888;
+        }
+
+        .log-panel {
+            grid-column: 1 / -1;
+        }
+
+        .log-container {
+            background: #0f0f23;
+            border-radius: 6px;
+            padding: 12px;
+            height: 150px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.8rem;
+        }
+
+        .log-entry {
+            padding: 2px 0;
+            color: #aaa;
+        }
+
+        .log-entry.info { color: #4a90d9; }
+        .log-entry.success { color: #4ad94a; }
+        .log-entry.warning { color: #d9a54a; }
+        .log-entry.error { color: #d94a4a; }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Latent-Space Model Training</h1>
+            <p>Configure and control model training</p>
+        </header>
+
+        <div class="main-grid">
+            <!-- Configuration Panel -->
+            <div class="panel">
+                <h3 class="panel-title">Configuration</h3>
+                
+                <div class="config-section">
+                    <h4>Model Architecture</h4>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="latent_dim">Latent Dimension</label>
+                            <input type="number" id="latent_dim" value="256">
+                        </div>
+                        <div class="config-field">
+                            <label for="prefix_len">Prefix Length</label>
+                            <input type="number" id="prefix_len" value="10">
+                        </div>
+                        <div class="config-field">
+                            <label for="middle_hidden_dim">Middle Hidden Dim</label>
+                            <input type="number" id="middle_hidden_dim" value="512">
+                        </div>
+                        <div class="config-field">
+                            <label for="middle_layers">Middle Layers</label>
+                            <input type="number" id="middle_layers" value="3">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="config-section">
+                    <h4>Training Parameters</h4>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="learning_rate">Learning Rate</label>
+                            <input type="number" id="learning_rate" value="0.0001" step="0.00001">
+                        </div>
+                        <div class="config-field">
+                            <label for="batch_size">Batch Size</label>
+                            <input type="number" id="batch_size" value="4">
+                        </div>
+                        <div class="config-field">
+                            <label for="num_epochs">Epochs</label>
+                            <input type="number" id="num_epochs" value="5">
+                        </div>
+                        <div class="config-field">
+                            <label for="gradient_accumulation_steps">Gradient Accumulation</label>
+                            <input type="number" id="gradient_accumulation_steps" value="1">
+                        </div>
+                        <div class="config-field">
+                            <label for="max_seq_len">Max Sequence Length</label>
+                            <input type="number" id="max_seq_len" value="256">
+                        </div>
+                        <div class="config-field">
+                            <label for="max_target_len">Max Target Length</label>
+                            <input type="number" id="max_target_len" value="128">
+                        </div>
+                        <div class="config-field">
+                            <label for="warmup_steps">Warmup Steps</label>
+                            <input type="number" id="warmup_steps" value="100">
+                        </div>
+                        <div class="config-field">
+                            <label for="weight_decay">Weight Decay</label>
+                            <input type="number" id="weight_decay" value="0.01" step="0.001">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="config-section">
+                    <h4>Data Settings</h4>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="max_train_samples">Max Train Samples</label>
+                            <input type="number" id="max_train_samples" value="10000">
+                        </div>
+                        <div class="config-field">
+                            <label for="save_every">Save Every N Steps</label>
+                            <input type="number" id="save_every" value="500">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="config-section">
+                    <h4>Device Settings</h4>
+                    <div class="config-grid">
+                        <div class="config-field">
+                            <label for="device">Device</label>
+                            <select id="device">
+                                <option value="cuda">CUDA (GPU)</option>
+                                <option value="cpu">CPU</option>
+                            </select>
+                        </div>
+                        <div class="config-field checkbox-field">
+                            <input type="checkbox" id="use_fp16" checked>
+                            <label for="use_fp16">Use FP16 (Mixed Precision)</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="buttons-row">
+                    <button id="btn-reset" class="btn-secondary">Back to Default</button>
+                </div>
+            </div>
+
+            <!-- Training Status Panel -->
+            <div class="panel">
+                <h3 class="panel-title">Training Status</h3>
+                
+                <div class="status-panel">
+                    <div class="status-indicator">
+                        <div class="status-dot" id="status-dot"></div>
+                        <span class="status-text" id="status-text">Idle</span>
+                    </div>
+                </div>
+
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Epoch</div>
+                        <div class="metric-value" id="metric-epoch">0 / 0</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Step</div>
+                        <div class="metric-value" id="metric-step">0</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Train Loss</div>
+                        <div class="metric-value" id="metric-train-loss">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Avg Loss</div>
+                        <div class="metric-value" id="metric-avg-loss">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Val Loss</div>
+                        <div class="metric-value" id="metric-val-loss">--</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Best Val Loss</div>
+                        <div class="metric-value highlight" id="metric-best-val-loss">--</div>
+                    </div>
+                </div>
+
+                <div class="progress-section">
+                    <div class="progress-label">
+                        <span>Progress</span>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                </div>
+
+                <div class="buttons-row">
+                    <button id="btn-start" class="btn-primary">Start Training</button>
+                    <button id="btn-pause" class="btn-warning" disabled>Pause</button>
+                    <button id="btn-resume" class="btn-success" disabled>Resume</button>
+                    <button id="btn-stop" class="btn-danger" disabled>Stop</button>
+                </div>
+            </div>
+
+            <!-- Log Panel -->
+            <div class="panel log-panel">
+                <h3 class="panel-title">Log</h3>
+                <div class="log-container" id="log-container">
+                    <div class="log-entry info">[System] Ready to start training</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        // Configuration fields
+        const configFields = [
+            'latent_dim', 'prefix_len', 'middle_hidden_dim', 'middle_layers',
+            'learning_rate', 'batch_size', 'num_epochs', 'gradient_accumulation_steps',
+            'max_seq_len', 'max_target_len', 'warmup_steps', 'weight_decay',
+            'max_train_samples', 'save_every', 'device', 'use_fp16'
+        ];
+
+        let defaultConfig = {};
+        let configTypes = {};
+        let isTraining = false;
+        let isPaused = false;
+        let hasPauseCheckpoint = false;
+
+        // Initialize socket connection
+        const socket = io();
+
+        // Socket event handlers
+        socket.on('connect', () => {
+            addLog('Connected to server', 'success');
+        });
+
+        socket.on('disconnect', () => {
+            addLog('Disconnected from server', 'error');
+        });
+
+        socket.on('metrics_update', (data) => {
+            updateMetrics(data);
+        });
+
+        socket.on('status_update', (data) => {
+            isTraining = data.is_running;
+            isPaused = data.is_paused;
+            updateMetrics(data.metrics);
+            updateButtons();
+        });
+
+        // Fetch default config on load
+        async function loadDefaultConfig() {
+            try {
+                const response = await fetch('/api/config');
+                const data = await response.json();
+                defaultConfig = data.defaults;
+                configTypes = data.types;
+                applyConfigToUI(defaultConfig);
+                addLog('Configuration loaded', 'info');
+            } catch (error) {
+                addLog('Failed to load configuration: ' + error.message, 'error');
+            }
+        }
+
+        // Apply config values to UI
+        function applyConfigToUI(config) {
+            for (const field of configFields) {
+                const element = document.getElementById(field);
+                if (element && config[field] !== undefined) {
+                    if (element.type === 'checkbox') {
+                        element.checked = config[field];
+                    } else {
+                        element.value = config[field];
+                    }
+                }
+            }
+        }
+
+        // Get config from UI
+        function getConfigFromUI() {
+            const config = {};
+            for (const field of configFields) {
+                const element = document.getElementById(field);
+                if (element) {
+                    if (element.type === 'checkbox') {
+                        config[field] = element.checked;
+                    } else if (configTypes[field] === 'int') {
+                        config[field] = parseInt(element.value, 10);
+                    } else if (configTypes[field] === 'float') {
+                        config[field] = parseFloat(element.value);
+                    } else {
+                        config[field] = element.value;
+                    }
+                }
+            }
+            return config;
+        }
+
+        // Update metrics display
+        function updateMetrics(metrics) {
+            if (!metrics) return;
+
+            const status = metrics.status || 'idle';
+            const statusDot = document.getElementById('status-dot');
+            const statusText = document.getElementById('status-text');
+
+            // Update status indicator
+            statusDot.className = 'status-dot';
+            if (status === 'idle' || status === 'completed') {
+                statusDot.classList.add(status === 'completed' ? 'completed' : 'idle');
+            } else if (status === 'paused') {
+                statusDot.classList.add('paused');
+            } else if (status.startsWith('error')) {
+                statusDot.classList.add('error');
+            } else {
+                statusDot.classList.add('running');
+            }
+
+            statusText.textContent = formatStatus(status);
+
+            // Update metrics
+            document.getElementById('metric-epoch').textContent = 
+                `${metrics.epoch || 0} / ${metrics.total_epochs || 0}`;
+            document.getElementById('metric-step').textContent = metrics.step || 0;
+            document.getElementById('metric-train-loss').textContent = 
+                metrics.train_loss ? metrics.train_loss.toFixed(4) : '--';
+            document.getElementById('metric-avg-loss').textContent = 
+                metrics.avg_loss ? metrics.avg_loss.toFixed(4) : '--';
+            document.getElementById('metric-val-loss').textContent = 
+                metrics.val_loss ? metrics.val_loss.toFixed(4) : '--';
+            document.getElementById('metric-best-val-loss').textContent = 
+                metrics.best_val_loss ? metrics.best_val_loss.toFixed(4) : '--';
+
+            // Update progress bar
+            const totalSteps = metrics.total_steps || 1;
+            const currentStep = metrics.step || 0;
+            const percent = Math.min(100, (currentStep / totalSteps) * 100);
+            document.getElementById('progress-bar').style.width = `${percent}%`;
+            document.getElementById('progress-percent').textContent = `${percent.toFixed(1)}%`;
+
+            // Update training state
+            if (status === 'completed' || status === 'idle' || status.startsWith('error')) {
+                isTraining = false;
+                isPaused = false;
+            } else if (status === 'paused') {
+                isTraining = false;
+                isPaused = true;
+                hasPauseCheckpoint = true;
+            } else {
+                isTraining = true;
+                isPaused = false;
+            }
+
+            updateButtons();
+        }
+
+        // Format status for display
+        function formatStatus(status) {
+            const statusMap = {
+                'idle': 'Idle',
+                'starting': 'Starting...',
+                'loading_data': 'Loading Data...',
+                'loading_model': 'Loading Model...',
+                'loading_checkpoint': 'Loading Checkpoint...',
+                'training': 'Training',
+                'validating': 'Validating...',
+                'pausing': 'Pausing...',
+                'paused': 'Paused',
+                'saving_pause_checkpoint': 'Saving Checkpoint...',
+                'stopping': 'Stopping...',
+                'resuming': 'Resuming...',
+                'completed': 'Completed'
+            };
+            return statusMap[status] || status;
+        }
+
+        // Update button states
+        function updateButtons() {
+            const btnStart = document.getElementById('btn-start');
+            const btnPause = document.getElementById('btn-pause');
+            const btnResume = document.getElementById('btn-resume');
+            const btnStop = document.getElementById('btn-stop');
+
+            btnStart.disabled = isTraining || isPaused;
+            btnPause.disabled = !isTraining;
+            btnResume.disabled = !isPaused && !hasPauseCheckpoint;
+            btnStop.disabled = !isTraining;
+
+            // Disable config fields during training
+            for (const field of configFields) {
+                const element = document.getElementById(field);
+                if (element) {
+                    element.disabled = isTraining;
+                }
+            }
+        }
+
+        // Add log entry
+        function addLog(message, type = 'info') {
+            const container = document.getElementById('log-container');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Button handlers
+        document.getElementById('btn-start').addEventListener('click', async () => {
+            try {
+                const config = getConfigFromUI();
+                addLog('Starting training...', 'info');
+                const response = await fetch('/api/training/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+                if (data.error) {
+                    addLog('Error: ' + data.error, 'error');
+                } else {
+                    addLog('Training started', 'success');
+                    isTraining = true;
+                    updateButtons();
+                }
+            } catch (error) {
+                addLog('Failed to start training: ' + error.message, 'error');
+            }
+        });
+
+        document.getElementById('btn-pause').addEventListener('click', async () => {
+            try {
+                addLog('Pausing training...', 'warning');
+                const response = await fetch('/api/training/pause', { method: 'POST' });
+                const data = await response.json();
+                if (data.error) {
+                    addLog('Error: ' + data.error, 'error');
+                } else {
+                    addLog('Pause requested', 'warning');
+                }
+            } catch (error) {
+                addLog('Failed to pause training: ' + error.message, 'error');
+            }
+        });
+
+        document.getElementById('btn-resume').addEventListener('click', async () => {
+            try {
+                addLog('Resuming training...', 'info');
+                const response = await fetch('/api/training/resume', { method: 'POST' });
+                const data = await response.json();
+                if (data.error) {
+                    addLog('Error: ' + data.error, 'error');
+                } else {
+                    addLog('Training resumed', 'success');
+                    hasPauseCheckpoint = false;
+                }
+            } catch (error) {
+                addLog('Failed to resume training: ' + error.message, 'error');
+            }
+        });
+
+        document.getElementById('btn-stop').addEventListener('click', async () => {
+            try {
+                addLog('Stopping training...', 'warning');
+                const response = await fetch('/api/training/stop', { method: 'POST' });
+                const data = await response.json();
+                if (data.error) {
+                    addLog('Error: ' + data.error, 'error');
+                } else {
+                    addLog('Stop requested', 'warning');
+                }
+            } catch (error) {
+                addLog('Failed to stop training: ' + error.message, 'error');
+            }
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            applyConfigToUI(defaultConfig);
+            addLog('Configuration reset to defaults', 'info');
+        });
+
+        // Initialize
+        loadDefaultConfig();
+
+        // Fetch initial status
+        fetch('/api/training/status')
+            .then(res => res.json())
+            .then(data => {
+                isTraining = data.is_running;
+                isPaused = data.is_paused;
+                hasPauseCheckpoint = data.has_pause_checkpoint;
+                updateMetrics(data.metrics);
+            })
+            .catch(err => console.error('Failed to fetch initial status:', err));
+    </script>
+</body>
+</html>

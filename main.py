@@ -5,7 +5,6 @@ Supports training and inference modes via command-line arguments.
 """
 
 import argparse
-import torch
 import sys
 
 # Suppress broken torchvision if necessary
@@ -149,6 +148,26 @@ def parse_args():
         help="Disable the Rich TUI for training"
     )
     
+    parser.add_argument(
+        "--website",
+        action="store_true",
+        help="Launch web interface for training control instead of direct training"
+    )
+    
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=5000,
+        help="Port for web interface (default: 5000)"
+    )
+    
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host for web interface (default: 127.0.0.1)"
+    )
+    
     return parser.parse_args()
 
 
@@ -188,7 +207,11 @@ def main():
         config.top_k = args.top_k
     
     # Run based on mode
-    if args.mode == "train":
+    if args.website:
+        # Launch web interface instead of direct training
+        from src.web import run_web_server
+        run_web_server(host=args.host, port=args.port)
+    elif args.mode == "train":
         print("="*50)
         print("Latent-Space Reasoning Model - Training")
         print("="*50)
@@ -245,6 +268,7 @@ def main():
             return
         
         # Initialize inference model
+        import torch
         device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         inference = LatentSpaceInference(args.checkpoint, config, device)
         
