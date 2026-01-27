@@ -18,7 +18,7 @@ class Config:
     middle_layers: int = 3
     
     # Training hyperparameters
-    learning_rate: float = 5e-5
+    learning_rate: float = 2e-5
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
     max_seq_len: int = 256
@@ -29,7 +29,7 @@ class Config:
     gpt2_model: str = "gpt2"  # This is GPT-2 Small (117M parameters)
     
     # Training settings
-    num_epochs: int = 20
+    num_epochs: int = 30
     warmup_steps: int = 100
     weight_decay: float = 0.01
     
