@@ -57,3 +57,9 @@ class Config:
     validation_split: str = "validation"
     test_split: str = "test"
     max_train_samples: int = 10000  # Use subset for faster prototyping
+    
+    # Diagnostic test modes
+    # None = normal training
+    # "bypass_middle" = Test B: z_out = z_in (skip middle model)
+    # "identity_task" = Test C: Train decoder adapter on identity task
+    test_mode: str = None

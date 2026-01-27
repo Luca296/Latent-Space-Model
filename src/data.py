@@ -196,3 +196,154 @@ def create_test_dataloader(config, test_samples: int = None) -> DataLoader:
     )
     
     return test_loader
+
+
+class IdentityDataset(Dataset):
+    """
+    Test C: Simple identity task dataset.
+    Input: "Hello world" -> Output: "Hello world"
+    
+    This tests if the decoder adapter can learn to reproduce input text.
+    If it fails on this trivial task, the adapter architecture is flawed.
+    """
+    
+    # Simple sentences for identity task
+    IDENTITY_SAMPLES = [
+        "Hello world",
+        "The quick brown fox jumps over the lazy dog",
+        "How are you doing today?",
+        "This is a simple test sentence",
+        "Machine learning is fascinating",
+        "I like to code in Python",
+        "The weather is nice today",
+        "What time is it?",
+        "Please pass the salt",
+        "Good morning everyone",
+        "See you later",
+        "Nice to meet you",
+        "Have a great day",
+        "Thank you very much",
+        "You are welcome",
+        "I am learning new things",
+        "The book is on the table",
+        "She walked to the store",
+        "He plays guitar well",
+        "We are going home",
+        "They finished the project",
+        "The cat sat on the mat",
+        "Birds fly in the sky",
+        "Fish swim in water",
+        "Trees grow in forests",
+        "The sun rises in the east",
+        "Stars shine at night",
+        "Rain falls from clouds",
+        "Snow covers the mountains",
+        "Rivers flow to the sea",
+    ]
+    
+    def __init__(
+        self,
+        modernbert_tokenizer_name: str = "answerdotai/ModernBERT-base",
+        gpt2_tokenizer_name: str = "gpt2",
+        max_seq_len: int = 64,
+        max_target_len: int = 64,
+        repeat_samples: int = 100  # Repeat samples to create larger dataset
+    ):
+        self.max_seq_len = max_seq_len
+        self.max_target_len = max_target_len
+        
+        # Load tokenizers
+        self.modernbert_tokenizer = AutoTokenizer.from_pretrained(modernbert_tokenizer_name)
+        self.gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_tokenizer_name)
+        
+        # Add pad token to GPT-2 if not present
+        if self.gpt2_tokenizer.pad_token is None:
+            self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
+        
+        # Create repeated samples
+        self.samples = self.IDENTITY_SAMPLES * repeat_samples
+        print(f"Created identity dataset with {len(self.samples)} samples")
+    
+    def __len__(self) -> int:
+        return len(self.samples)
+    
+    def __getitem__(self, idx: int) -> dict:
+        """Get a single sample - input and output are the same text."""
+        text = self.samples[idx]
+        
+        # Tokenize input with ModernBERT tokenizer
+        input_encoding = self.modernbert_tokenizer(
+            text,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Tokenize target (same text) with GPT-2 tokenizer
+        target_encoding = self.gpt2_tokenizer(
+            text,
+            max_length=self.max_target_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": input_encoding["input_ids"].squeeze(0),
+            "attention_mask": input_encoding["attention_mask"].squeeze(0),
+            "target_ids": target_encoding["input_ids"].squeeze(0),
+            "target_attention_mask": target_encoding["attention_mask"].squeeze(0),
+            "dialogue": text,  # Keep key name for compatibility
+            "summary": text    # Same as input for identity task
+        }
+
+
+def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
+    """
+    Create train and validation dataloaders for identity task (Test C).
+    
+    Args:
+        config: Configuration object
+        
+    Returns:
+        train_loader, val_loader
+    """
+    # Create training dataset with many repetitions
+    train_dataset = IdentityDataset(
+        modernbert_tokenizer_name=config.modernbert_model,
+        gpt2_tokenizer_name=config.gpt2_model,
+        max_seq_len=config.max_seq_len,
+        max_target_len=config.max_target_len,
+        repeat_samples=100  # 3000 training samples
+    )
+    
+    # Create smaller validation dataset
+    val_dataset = IdentityDataset(
+        modernbert_tokenizer_name=config.modernbert_model,
+        gpt2_tokenizer_name=config.gpt2_model,
+        max_seq_len=config.max_seq_len,
+        max_target_len=config.max_target_len,
+        repeat_samples=10  # 300 validation samples
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    return train_loader, val_loader

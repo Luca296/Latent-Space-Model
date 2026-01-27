@@ -156,6 +156,9 @@ class LatentSpaceModel(nn.Module):
         super().__init__()
         self.config = config
         
+        # Test mode: bypass_middle skips the middle model (z_out = z_in)
+        self.bypass_middle = getattr(config, 'test_mode', None) == 'bypass_middle'
+        
         # Initialize components
         self.encoder = LatentEncoder(
             model_name=config.modernbert_model,
@@ -207,8 +210,11 @@ class LatentSpaceModel(nn.Module):
         # Encode input to latent space
         z_in = self.encoder(input_ids, attention_mask)  # [B, latent_dim]
         
-        # Transform latent with middle model
-        z_out = self.middle_model(z_in)  # [B, latent_dim]
+        # Transform latent with middle model (or bypass for Test B)
+        if self.bypass_middle:
+            z_out = z_in  # Test B: Skip middle model entirely
+        else:
+            z_out = self.middle_model(z_in)  # [B, latent_dim]
         
         # Expand to prefix embeddings
         prefix_embeddings = self.prefix_adapter(z_out)  # [B, prefix_len, gpt2_hidden_dim]
@@ -241,7 +247,10 @@ class LatentSpaceModel(nn.Module):
     def encode_to_latent(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space (for inference)."""
         z_in = self.encoder(input_ids, attention_mask)
-        z_out = self.middle_model(z_in)
+        if self.bypass_middle:
+            z_out = z_in  # Test B: Skip middle model
+        else:
+            z_out = self.middle_model(z_in)
         return z_out
     
     def get_prefix_embeddings(self, z_out: torch.Tensor) -> torch.Tensor:

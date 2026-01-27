@@ -34,7 +34,7 @@ from rich.text import Text
 from rich import box
 
 from src.models import LatentSpaceModel
-from src.data import create_dataloaders
+from src.data import create_dataloaders, create_identity_dataloaders
 from src.config import Config
 
 
@@ -388,11 +388,56 @@ def train(config: Config):
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    print("Creating dataloaders...")
-    train_loader, val_loader = create_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
+    # Check for diagnostic test modes
+    test_mode = getattr(config, 'test_mode', None)
+    
+    if test_mode == 'bypass_middle':
+        print("\n" + "="*60)
+        print("TEST B: BYPASS MIDDLE MODEL (z_out = z_in)")
+        print("="*60)
+        print("If output is still nonsense -> decoder adapter is the problem")
+        print("If output improves -> middle model transformation is the issue")
+        print("="*60 + "\n")
+    elif test_mode == 'identity_task':
+        print("\n" + "="*60)
+        print("TEST C: IDENTITY TASK - Train decoder adapter only")
+        print("="*60)
+        print("Freezing: encoder, middle model")
+        print("Training: prefix_adapter (expansion MLP) only")
+        print("Task: Input='Hello world' -> Output='Hello world'")
+        print("If it can't reproduce simple text -> adapter is not aligned")
+        print("="*60 + "\n")
+    
+    # Create dataloaders based on test mode
+    if test_mode == 'identity_task':
+        print("Creating identity task dataloaders...")
+        train_loader, val_loader = create_identity_dataloaders(config)
+    else:
+        print("Creating dataloaders...")
+        train_loader, val_loader = create_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
     
     print("Initializing model...")
     model = LatentSpaceModel(config).to(device)
+    
+    # For Test C: Freeze everything except prefix_adapter
+    if test_mode == 'identity_task':
+        print("\nFreezing components for Test C...")
+        
+        # Freeze encoder compression MLP
+        for param in model.encoder.compression_mlp.parameters():
+            param.requires_grad = False
+        print("  - Frozen: encoder.compression_mlp")
+        
+        # Freeze middle model
+        for param in model.middle_model.parameters():
+            param.requires_grad = False
+        print("  - Frozen: middle_model")
+        
+        # Ensure prefix_adapter is trainable
+        for param in model.prefix_adapter.parameters():
+            param.requires_grad = True
+        print("  - Trainable: prefix_adapter (expansion MLP)")
+        print()
     
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params:,}")

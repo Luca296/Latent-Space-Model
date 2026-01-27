@@ -168,6 +168,15 @@ def parse_args():
         help="Host for web interface (default: 127.0.0.1)"
     )
     
+    # Diagnostic test modes
+    parser.add_argument(
+        "--test-mode",
+        type=str,
+        choices=["bypass_middle", "identity_task"],
+        default=None,
+        help="Diagnostic test mode: bypass_middle (Test B) or identity_task (Test C)"
+    )
+    
     return parser.parse_args()
 
 
@@ -206,6 +215,10 @@ def main():
     if args.top_k is not None:
         config.top_k = args.top_k
     
+    # Diagnostic test mode
+    if args.test_mode is not None:
+        config.test_mode = args.test_mode
+    
     # Run based on mode
     if args.website:
         # Launch web interface instead of direct training
@@ -224,6 +237,8 @@ def main():
         print(f"  Mixed precision: {config.use_fp16}")
         print(f"  Latent dim: {config.latent_dim}")
         print(f"  Prefix length: {config.prefix_len}")
+        if config.test_mode:
+            print(f"  Test mode: {config.test_mode}")
         print("="*50 + "\n")
         
         train(config)
