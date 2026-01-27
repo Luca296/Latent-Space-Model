@@ -71,15 +71,25 @@ def save_checkpoint(
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
+    temp_path = checkpoint_path.with_suffix(".pt.tmp")
     
-    torch.save({
-        "step": step,
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "config": config
-    }, checkpoint_path)
+    try:
+        torch.save({
+            "step": step,
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "config": config
+        }, temp_path)
+        os.replace(temp_path, checkpoint_path)
+    except Exception as exc:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        print(f"Warning: failed to save checkpoint at step {step}: {exc}")
 
 
 def cleanup_checkpoints(config: Config):
