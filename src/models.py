@@ -121,6 +121,7 @@ class PrefixAdapter(nn.Module):
         self.latent_dim = latent_dim
         self.prefix_len = prefix_len
         self.gpt2_hidden_dim = gpt2_hidden_dim
+        self.eps = 1e-8
         
         # Expansion MLP: latent_dim -> prefix_len * gpt2_hidden_dim
         self.expansion_mlp = nn.Sequential(
@@ -140,8 +141,11 @@ class PrefixAdapter(nn.Module):
         """
         batch_size = z_out.size(0)
         
+        # Normalize latent vector before expansion (stabilizes norm distribution)
+        z_norm = z_out / (torch.norm(z_out, dim=-1, keepdim=True) + self.eps)
+        
         # Expand to prefix dimensions
-        expanded = self.expansion_mlp(z_out)  # [B, prefix_len * gpt2_hidden_dim]
+        expanded = self.expansion_mlp(z_norm)  # [B, prefix_len * gpt2_hidden_dim]
         
         # Reshape to prefix embeddings
         prefix_embeddings = expanded.view(batch_size, self.prefix_len, self.gpt2_hidden_dim)
@@ -177,6 +181,8 @@ class LatentSpaceModel(nn.Module):
             prefix_len=config.prefix_len,
             gpt2_hidden_dim=config.gpt2_hidden_dim
         )
+        # LayerNorm to match GPT-2 embedding normalization
+        self.prefix_layernorm = nn.LayerNorm(config.gpt2_hidden_dim)
         
         # Load GPT-2 for decoding
         self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
@@ -218,6 +224,7 @@ class LatentSpaceModel(nn.Module):
         
         # Expand to prefix embeddings
         prefix_embeddings = self.prefix_adapter(z_out)  # [B, prefix_len, gpt2_hidden_dim]
+        prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
         
         # Get target token embeddings (teacher forcing)
         batch_size = target_ids.size(0)
@@ -255,7 +262,8 @@ class LatentSpaceModel(nn.Module):
     
     def get_prefix_embeddings(self, z_out: torch.Tensor) -> torch.Tensor:
         """Get prefix embeddings from latent vector (for inference)."""
-        return self.prefix_adapter(z_out)
+        prefix_embeddings = self.prefix_adapter(z_out)
+        return self.prefix_layernorm(prefix_embeddings)
     
     def generate(
         self,
