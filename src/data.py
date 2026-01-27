@@ -222,7 +222,7 @@ def create_dataloaders(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
     
@@ -231,7 +231,7 @@ def create_dataloaders(
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
     
@@ -264,7 +264,7 @@ def create_test_dataloader(config, test_samples: int = None) -> DataLoader:
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
     
@@ -406,7 +406,7 @@ def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
     
@@ -415,7 +415,7 @@ def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
     
@@ -456,7 +456,7 @@ def create_phase1_dataloaders(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
 
@@ -465,7 +465,7 @@ def create_phase1_dataloaders(
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=config.num_workers,
         pin_memory=True if torch.cuda.is_available() else False
     )
 
