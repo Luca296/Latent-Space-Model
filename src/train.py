@@ -43,18 +43,22 @@ from src.config import Config
 def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor, 
                  target_attention_mask: torch.Tensor) -> torch.Tensor:
     """Compute cross-entropy loss for decoder outputs."""
-    target_ids_shifted = target_ids[:, 1:]
-    target_mask_shifted = target_attention_mask[:, 1:]
+    # We now predict target_ids[:, :-1] using prefix + target_ids[:, :-1]
+    # Logit at prefix_len-1 predicts target[0]
+    # Logit at prefix_len predicts target[1]
+    # So we compare logits with target_ids[:, :-1]
+    target_ids_to_predict = target_ids[:, :-1]
+    target_mask_to_predict = target_attention_mask[:, :-1]
     
     batch_size, seq_len, vocab_size = logits.shape
     logits_flat = logits.reshape(-1, vocab_size)
-    target_ids_flat = target_ids_shifted.reshape(-1)
-    target_mask_flat = target_mask_shifted.reshape(-1)
+    target_ids_flat = target_ids_to_predict.reshape(-1)
+    target_mask_flat = target_mask_to_predict.reshape(-1)
     
     loss_fct = nn.CrossEntropyLoss(ignore_index=0, reduction='none')
     loss_per_token = loss_fct(logits_flat, target_ids_flat)
     loss_per_token = loss_per_token * target_mask_flat.float()
-    loss = loss_per_token.sum() / target_mask_flat.sum()
+    loss = loss_per_token.sum() / torch.clamp(target_mask_flat.sum(), min=1e-9)
     
     return loss
 

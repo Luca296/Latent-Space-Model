@@ -160,8 +160,16 @@ class LatentSpaceModel(nn.Module):
         super().__init__()
         self.config = config
         
-        # Test mode: bypass_middle skips the middle model (z_out = z_in)
-        self.bypass_middle = getattr(config, 'test_mode', None) == 'bypass_middle'
+        # Determine if we should bypass the middle model
+        self.training_phase = getattr(config, 'training_phase', 'normal')
+        self.test_mode = getattr(config, 'test_mode', None)
+        
+        self.bypass_middle = (
+            self.test_mode == 'bypass_middle' or 
+            self.test_mode == 'phase1_decoder' or 
+            self.test_mode == 'phase2_encoder' or
+            self.training_phase in ['phase1', 'phase2']
+        )
         
         # Initialize components
         self.encoder = LatentEncoder(
@@ -216,9 +224,9 @@ class LatentSpaceModel(nn.Module):
         # Encode input to latent space
         z_in = self.encoder(input_ids, attention_mask)  # [B, latent_dim]
         
-        # Transform latent with middle model (or bypass for Test B)
+        # Transform latent with middle model (or bypass for Phases 1 & 2)
         if self.bypass_middle:
-            z_out = z_in  # Test B: Skip middle model entirely
+            z_out = z_in  # Skip middle model
         else:
             z_out = self.middle_model(z_in)  # [B, latent_dim]
         
@@ -226,9 +234,11 @@ class LatentSpaceModel(nn.Module):
         prefix_embeddings = self.prefix_adapter(z_out)  # [B, prefix_len, gpt2_hidden_dim]
         prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
         
-        # Get target token embeddings (teacher forcing)
+        # Prepare target input for teacher forcing
         batch_size = target_ids.size(0)
-        target_input_ids = target_ids[:, :-1]  # Shift for teacher forcing
+        # We use target_ids[:, :-1] as input to predict target_ids[:, 1:]
+        # BUT we also want the prefix to predict target_ids[:, 0]
+        target_input_ids = target_ids[:, :-1]  # [B, T-1]
         target_embeddings = self.gpt2_embeddings(target_input_ids)  # [B, T-1, gpt2_hidden_dim]
         
         # Concatenate prefix and target embeddings
@@ -239,23 +249,28 @@ class LatentSpaceModel(nn.Module):
         target_attention = target_attention_mask[:, :-1]
         combined_attention = torch.cat([prefix_attention, target_attention], dim=1)
         
-        # Run GPT-2. Even though GPT-2 is frozen, we need gradients to flow 
-        # back through it to the prefix embeddings.
+        # Run GPT-2
         outputs = self.gpt2(
             inputs_embeds=input_embeds,
             attention_mask=combined_attention
         )
         
-        # Get logits for target positions (skip prefix)
-        logits = outputs.logits[:, self.config.prefix_len:, :]  # [B, T-1, vocab_size]
+        # LOGIT SLICING FIX:
+        # Index prefix_len - 1 is the last token of the prefix, it predicts target[0]
+        # Index prefix_len is the first token of the target, it predicts target[1]
+        # ... and so on.
+        # We want to return logits that correspond to target_ids[:, 0 : T-1]
+        logits = outputs.logits[:, self.config.prefix_len - 1 : -1, :]  # [B, T-1, vocab_size]
         
         return logits
     
     def encode_to_latent(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space (for inference)."""
         z_in = self.encoder(input_ids, attention_mask)
+        
+        # Re-check bypass in case it changed (though usually constant for model lifetime)
         if self.bypass_middle:
-            z_out = z_in  # Test B: Skip middle model
+            z_out = z_in
         else:
             z_out = self.middle_model(z_in)
         return z_out
