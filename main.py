@@ -172,9 +172,9 @@ def parse_args():
     parser.add_argument(
         "--test-mode",
         type=str,
-        choices=["bypass_middle", "identity_task", "phase1_decoder"],
+        choices=["bypass_middle", "identity_task", "phase1_decoder", "phase2_encoder"],
         default=None,
-        help="Diagnostic test mode: bypass_middle (Test B), identity_task (Test C), or phase1_decoder (Phase 1)"
+        help="Diagnostic test mode: bypass_middle (Test B), identity_task (Test C), phase1_decoder (Phase 1), or phase2_encoder (Phase 2)"
     )
     
     return parser.parse_args()

@@ -31,7 +31,7 @@ Training the encoder compression, middle model, and decoder expansion simultaneo
 * **Task:** Identity mapping.
 * **Outcome:** GPT-2 learns to decode latent vectors derived from real text.
 
-### [] Phase 2: Train Encoder Compression
+### [X] Phase 2: Train Encoder Compression
 **Goal:** Map input to the stabilized latent space.
 * **Components:** Compression head + Expansion head + Optional LoRA.
 

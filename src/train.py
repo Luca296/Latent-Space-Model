@@ -34,7 +34,7 @@ from rich.text import Text
 from rich import box
 
 from src.models import LatentSpaceModel
-from src.data import create_dataloaders, create_identity_dataloaders
+from src.data import create_dataloaders, create_identity_dataloaders, create_phase1_dataloaders
 from src.config import Config
 
 
@@ -419,11 +419,23 @@ def train(config: Config):
         print("Training: prefix_adapter + prefix_layernorm")
         print("Task: Real text reconstruction (SAMSum dialogues)")
         print("="*60 + "\n")
+    elif test_mode == 'phase2_encoder':
+        print("\n" + "="*60)
+        print("PHASE 2: TRAIN ENCODER COMPRESSION (Sequential Training)")
+        print("="*60)
+        print("Goal: Map input to the stabilized latent space")
+        print("Freezing: middle model")
+        print("Training: encoder compression + prefix_adapter + prefix_layernorm")
+        print("Task: Real text reconstruction (SAMSum dialogues)")
+        print("="*60 + "\n")
     
     # Create dataloaders based on test mode
     if test_mode == 'identity_task':
         print("Creating identity task dataloaders...")
         train_loader, val_loader = create_identity_dataloaders(config)
+    elif test_mode == 'phase1_decoder' or test_mode == 'phase2_encoder':
+        print("Creating Phase 1/2 dataloaders (Identity SAMSum)...")
+        train_loader, val_loader = create_phase1_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
     else:
         print("Creating dataloaders...")
         train_loader, val_loader = create_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
@@ -457,6 +469,39 @@ def train(config: Config):
         for param in model.encoder.compression_mlp.parameters():
             param.requires_grad = False
         print("  - Frozen: encoder.compression_mlp")
+
+        # Freeze middle model
+        for param in model.middle_model.parameters():
+            param.requires_grad = False
+        print("  - Frozen: middle_model")
+
+        # Ensure prefix adapter + LayerNorm are trainable
+        for param in model.prefix_adapter.parameters():
+            param.requires_grad = True
+        for param in model.prefix_layernorm.parameters():
+            param.requires_grad = True
+        print("  - Trainable: prefix_adapter (expansion MLP)")
+        print("  - Trainable: prefix_layernorm")
+        print()
+    elif test_mode == 'phase2_encoder':
+        print("\nConfiguring components for Phase 2...")
+        
+        # Load Phase 1 Checkpoint
+        checkpoint_path = Path(config.checkpoint_dir) / "best_model.pt"
+        if checkpoint_path.exists():
+            print(f"Loading Phase 1 checkpoint from {checkpoint_path}...")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            # strict=False because we might be modifying architecture in future or backward compatibility
+            # In this exact flow, keys should match.
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            print("Checkpoint loaded.")
+        else:
+            print("[WARNING] Phase 1 checkpoint not found! Starting from scratch (not recommended for Phase 2).")
+
+        # Unfreeze encoder compression MLP
+        for param in model.encoder.compression_mlp.parameters():
+            param.requires_grad = True
+        print("  - Trainable: encoder.compression_mlp")
 
         # Freeze middle model
         for param in model.middle_model.parameters():

@@ -60,8 +60,11 @@ class Config:
     max_train_samples: int = 10000  # Use subset for faster prototyping
     
     # Diagnostic test modes
-    # None = normal training
-    # "bypass_middle" = Test B: z_out = z_in (skip middle model)
-    # "identity_task" = Test C: Train decoder adapter on identity task
-    # "phase1_decoder" = Phase 1: Align decoder adapter on real text
+    # "normal" = Standard training (Dialog -> Summary, all trainable)
+    # "phase1" = Align Decoder (Simple Identity, train decoder only)
+    # "phase2" = Train Encoder (SAMSum Identity, train encoder+decoder, bypass middle)
+    # "phase3" = Train Middle (SAMSum, train middle only, freeze others)
+    training_phase: str = "normal"
+    
+    # Deprecated (kept for backward compatibility)
     test_mode: str = None
