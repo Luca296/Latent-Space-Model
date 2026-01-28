@@ -679,40 +679,59 @@
         let isPaused = false;
         let hasPauseCheckpoint = false;
 
-        // Initialize socket connection
-        const socket = io();
+        async function fetchJson(url, options = {}) {
+            const response = await fetch(url, options);
+            const text = await response.text();
+            let data;
+            try {
+                data = text ? JSON.parse(text) : {};
+            } catch (e) {
+                throw new Error(`Invalid JSON response from ${url}: ${text}`);
+            }
+            if (!response.ok) {
+                const message = data && data.error ? data.error : `Request failed: ${response.status}`;
+                throw new Error(message);
+            }
+            return data;
+        }
 
-        // Socket event handlers
-        socket.on('connect', () => {
-            addLog('Connected to server', 'success');
-        });
+        // Initialize socket connection (guard if socket.io fails to load)
+        let socket = null;
+        if (typeof io !== 'undefined') {
+            socket = io();
 
-        socket.on('disconnect', () => {
-            addLog('Disconnected from server', 'error');
-        });
+            // Socket event handlers
+            socket.on('connect', () => {
+                addLog('Connected to server', 'success');
+            });
 
-        socket.on('metrics_update', (data) => {
-            updateMetrics(data);
-        });
+            socket.on('disconnect', () => {
+                addLog('Disconnected from server', 'error');
+            });
 
-        socket.on('status_update', (data) => {
-            isTraining = data.is_running;
-            isPaused = data.is_paused;
-            updateMetrics(data.metrics);
-            updateButtons();
-        });
+            socket.on('metrics_update', (data) => {
+                updateMetrics(data);
+            });
+
+            socket.on('status_update', (data) => {
+                isTraining = data.is_running;
+                isPaused = data.is_paused;
+                updateMetrics(data.metrics);
+                updateButtons();
+            });
+        } else {
+            addLog('Socket.IO not available. Live metrics will be disabled.', 'warning');
+        }
 
         // Fetch default config on load
         async function loadDefaultConfig() {
             try {
-                const response = await fetch('/api/config');
-                const data = await response.json();
+                const data = await fetchJson('/api/config');
                 defaultConfig = data.defaults;
                 configTypes = data.types;
                 
                 // Try to load saved config first
-                const savedResponse = await fetch('/api/config/saved');
-                const savedData = await savedResponse.json();
+                const savedData = await fetchJson('/api/config/saved');
                 
                 if (savedData.exists && savedData.saved) {
                     savedConfig = savedData.saved;
@@ -722,15 +741,6 @@
                     applyConfigToUI(defaultConfig);
                     addLog('Configuration loaded (defaults)', 'info');
                 }
-            } catch (error) {
-                addLog('Failed to load configuration: ' + error.message, 'error');
-            }
-        }
-                const data = await response.json();
-                defaultConfig = data.defaults;
-                configTypes = data.types;
-                applyConfigToUI(defaultConfig);
-                addLog('Configuration loaded', 'info');
             } catch (error) {
                 addLog('Failed to load configuration: ' + error.message, 'error');
             }
@@ -900,12 +910,11 @@
             try {
                 const config = getConfigFromUI();
                 addLog('Starting training...', 'info');
-                const response = await fetch('/api/training/start', {
+                const data = await fetchJson('/api/training/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(config)
                 });
-                const data = await response.json();
                 if (data.error) {
                     addLog('Error: ' + data.error, 'error');
                 } else {
@@ -921,8 +930,7 @@
         document.getElementById('btn-pause').addEventListener('click', async () => {
             try {
                 addLog('Pausing training...', 'warning');
-                const response = await fetch('/api/training/pause', { method: 'POST' });
-                const data = await response.json();
+                const data = await fetchJson('/api/training/pause', { method: 'POST' });
                 if (data.error) {
                     addLog('Error: ' + data.error, 'error');
                 } else {
@@ -936,8 +944,7 @@
         document.getElementById('btn-resume').addEventListener('click', async () => {
             try {
                 addLog('Resuming training...', 'info');
-                const response = await fetch('/api/training/resume', { method: 'POST' });
-                const data = await response.json();
+                const data = await fetchJson('/api/training/resume', { method: 'POST' });
                 if (data.error) {
                     addLog('Error: ' + data.error, 'error');
                 } else {
@@ -952,8 +959,7 @@
         document.getElementById('btn-stop').addEventListener('click', async () => {
             try {
                 addLog('Stopping training...', 'warning');
-                const response = await fetch('/api/training/stop', { method: 'POST' });
-                const data = await response.json();
+                const data = await fetchJson('/api/training/stop', { method: 'POST' });
                 if (data.error) {
                     addLog('Error: ' + data.error, 'error');
                 } else {
@@ -966,8 +972,7 @@
 
         document.getElementById('btn-reset').addEventListener('click', async () => {
             try {
-                const response = await fetch('/api/config/reload', { method: 'POST' });
-                const data = await response.json();
+                const data = await fetchJson('/api/config/reload', { method: 'POST' });
                 defaultConfig = data.defaults;
                 applyConfigToUI(defaultConfig);
                 addLog('Configuration reloaded from hardcoded defaults', 'info');
@@ -980,12 +985,11 @@
         document.getElementById('btn-save-config').addEventListener('click', async () => {
             try {
                 const config = getConfigFromUI();
-                const response = await fetch('/api/config/save', {
+                const data = await fetchJson('/api/config/save', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(config)
                 });
-                const data = await response.json();
                 if (data.status === 'saved') {
                     savedConfig = config;
                     addLog('Configuration saved to config_saved.json', 'success');

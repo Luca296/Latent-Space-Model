@@ -1,0 +1,20 @@
+{
+  "latent_dim": 256,
+  "prefix_len": 25,
+  "middle_hidden_dim": 512,
+  "middle_layers": 3,
+  "num_encoder_unfrozen_layers": 2,
+  "test_mode": "phase1_decoder",
+  "learning_rate": 2e-05,
+  "batch_size": 20,
+  "num_epochs": 30,
+  "gradient_accumulation_steps": 2,
+  "max_seq_len": 512,
+  "max_target_len": 256,
+  "warmup_steps": 100,
+  "weight_decay": 0.01,
+  "max_train_samples": 10000,
+  "save_every": 500,
+  "device": "cuda",
+  "use_fp16": true
+}
