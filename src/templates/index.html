@@ -457,35 +457,40 @@
                         <div class="config-field">
                             <label for="test_mode">Training Mode</label>
                             <select id="test_mode">
-                                <option value="">Normal</option>
+                                <option value="">Normal (Summarization)</option>
                                 <option value="phase1_decoder">Phase 1: Align Decoder</option>
+                                <option value="phase2_encoder">Phase 2: Train Encoder</option>
                                 <option value="identity_task">Identity Task (Test C)</option>
                                 <option value="bypass_middle">Bypass Middle (Test B)</option>
                             </select>
                         </div>
                         <div class="config-field">
+                            <label for="num_encoder_unfrozen_layers">Unfrozen Encoder Layers</label>
+                            <input type="number" id="num_encoder_unfrozen_layers" value="2" min="0" max="12">
+                        </div>
+                        <div class="config-field">
                             <label for="learning_rate">Learning Rate</label>
-                            <input type="number" id="learning_rate" value="0.0001" step="0.00001">
+                            <input type="number" id="learning_rate" value="0.00002" step="0.00001">
                         </div>
                         <div class="config-field">
                             <label for="batch_size">Batch Size</label>
-                            <input type="number" id="batch_size" value="4">
+                            <input type="number" id="batch_size" value="20">
                         </div>
                         <div class="config-field">
                             <label for="num_epochs">Epochs</label>
-                            <input type="number" id="num_epochs" value="5">
+                            <input type="number" id="num_epochs" value="30">
                         </div>
                         <div class="config-field">
                             <label for="gradient_accumulation_steps">Gradient Accumulation</label>
-                            <input type="number" id="gradient_accumulation_steps" value="1">
+                            <input type="number" id="gradient_accumulation_steps" value="2">
                         </div>
                         <div class="config-field">
                             <label for="max_seq_len">Max Sequence Length</label>
-                            <input type="number" id="max_seq_len" value="256">
+                            <input type="number" id="max_seq_len" value="512">
                         </div>
                         <div class="config-field">
                             <label for="max_target_len">Max Target Length</label>
-                            <input type="number" id="max_target_len" value="128">
+                            <input type="number" id="max_target_len" value="256">
                         </div>
                         <div class="config-field">
                             <label for="warmup_steps">Warmup Steps</label>
@@ -530,7 +535,8 @@
                 </div>
 
                 <div class="buttons-row">
-                    <button id="btn-reset" class="btn-secondary">Back to Default</button>
+                    <button id="btn-save-config" class="btn-primary">Save Config</button>
+                    <button id="btn-reset" class="btn-secondary">Reload Defaults</button>
                 </div>
             </div>
 
@@ -660,12 +666,14 @@
         // Configuration fields
         const configFields = [
             'latent_dim', 'prefix_len', 'middle_hidden_dim', 'middle_layers',
+            'num_encoder_unfrozen_layers',
             'test_mode', 'learning_rate', 'batch_size', 'num_epochs', 'gradient_accumulation_steps',
             'max_seq_len', 'max_target_len', 'warmup_steps', 'weight_decay',
             'max_train_samples', 'save_every', 'device', 'use_fp16'
         ];
 
         let defaultConfig = {};
+        let savedConfig = null;
         let configTypes = {};
         let isTraining = false;
         let isPaused = false;
@@ -698,6 +706,26 @@
         async function loadDefaultConfig() {
             try {
                 const response = await fetch('/api/config');
+                const data = await response.json();
+                defaultConfig = data.defaults;
+                configTypes = data.types;
+                
+                // Try to load saved config first
+                const savedResponse = await fetch('/api/config/saved');
+                const savedData = await savedResponse.json();
+                
+                if (savedData.exists && savedData.saved) {
+                    savedConfig = savedData.saved;
+                    applyConfigToUI(savedConfig);
+                    addLog('Loaded saved configuration from config_saved.json', 'info');
+                } else {
+                    applyConfigToUI(defaultConfig);
+                    addLog('Configuration loaded (defaults)', 'info');
+                }
+            } catch (error) {
+                addLog('Failed to load configuration: ' + error.message, 'error');
+            }
+        }
                 const data = await response.json();
                 defaultConfig = data.defaults;
                 configTypes = data.types;
@@ -936,9 +964,35 @@
             }
         });
 
-        document.getElementById('btn-reset').addEventListener('click', () => {
-            applyConfigToUI(defaultConfig);
-            addLog('Configuration reset to defaults', 'info');
+        document.getElementById('btn-reset').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/config/reload', { method: 'POST' });
+                const data = await response.json();
+                defaultConfig = data.defaults;
+                applyConfigToUI(defaultConfig);
+                addLog('Configuration reloaded from hardcoded defaults', 'info');
+            } catch (error) {
+                addLog('Failed to reload configuration: ' + error.message, 'error');
+            }
+        });
+
+        // Save config button handler
+        document.getElementById('btn-save-config').addEventListener('click', async () => {
+            try {
+                const config = getConfigFromUI();
+                const response = await fetch('/api/config/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                const data = await response.json();
+                if (data.status === 'saved') {
+                    savedConfig = config;
+                    addLog('Configuration saved to config_saved.json', 'success');
+                }
+            } catch (error) {
+                addLog('Failed to save configuration: ' + error.message, 'error');
+            }
         });
 
         // Inference functionality

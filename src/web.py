@@ -61,6 +61,9 @@ class TrainingState:
 training_state = TrainingState()
 
 
+CONFIG_JSON_PATH = Path("config_saved.json")
+
+
 def create_app():
     """Create and configure the Flask application."""
     app = Flask(__name__, 
@@ -92,6 +95,21 @@ def create_app():
                 type_map[field.name] = "str"
         return type_map
     
+    def load_saved_config() -> Optional[Dict[str, Any]]:
+        """Load saved config from JSON file if it exists."""
+        if CONFIG_JSON_PATH.exists():
+            try:
+                with open(CONFIG_JSON_PATH, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return None
+        return None
+    
+    def save_config_to_json(config_dict: Dict[str, Any]):
+        """Save config to JSON file."""
+        with open(CONFIG_JSON_PATH, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+    
     @app.route('/')
     def index():
         """Serve the main page."""
@@ -105,11 +123,38 @@ def create_app():
             "types": get_config_field_types()
         })
     
+    @app.route('/api/config/saved', methods=['GET'])
+    def get_saved_config():
+        """Get saved configuration from JSON file."""
+        saved = load_saved_config()
+        return jsonify({
+            "saved": saved,
+            "exists": saved is not None
+        })
+    
+    @app.route('/api/config/save', methods=['POST'])
+    def save_config():
+        """Save configuration to JSON file."""
+        data = request.get_json() or {}
+        save_config_to_json(data)
+        return jsonify({"status": "saved"})
+    
+    @app.route('/api/config/reload', methods=['POST'])
+    def reload_config():
+        """Reload config from hardcoded defaults (Config class)."""
+        return jsonify({
+            "defaults": get_default_config(),
+            "types": get_config_field_types()
+        })
+    
     @app.route('/api/config/current', methods=['GET'])
     def get_current_config():
-        """Get current training configuration (if training is active)."""
+        """Get current training configuration (if training is active), or saved config, or defaults."""
         if training_state.current_config:
             return jsonify(asdict(training_state.current_config))
+        saved = load_saved_config()
+        if saved:
+            return jsonify(saved)
         return jsonify(get_default_config())
     
     @app.route('/api/training/start', methods=['POST'])
@@ -358,6 +403,13 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
                 train_samples=config.max_train_samples,
                 val_samples=1000
             )
+        elif getattr(config, "test_mode", None) == "phase2_encoder":
+            # Phase 2 uses actual SAMSum summarization dataset
+            train_loader, val_loader = create_dataloaders(
+                config,
+                train_samples=config.max_train_samples,
+                val_samples=1000
+            )
         else:
             train_loader, val_loader = create_dataloaders(
                 config,
@@ -382,6 +434,31 @@ def run_training_thread(config: Config, socketio: SocketIO, resume_from: Optiona
             if getattr(config, "test_mode", None) == "phase1_decoder":
                 for param in model.prefix_layernorm.parameters():
                     param.requires_grad = True
+        # Phase 2: Train encoder + decoder, unfreeze top encoder layers
+        elif getattr(config, "test_mode", None) == "phase2_encoder":
+            # Load Phase 1 checkpoint if available
+            checkpoint_path = Path(config.checkpoint_dir) / "best_model.pt"
+            if checkpoint_path.exists():
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                else:
+                    model.load_state_dict(checkpoint, strict=False)
+            
+            # Unfreeze encoder compression MLP
+            for param in model.encoder.compression_mlp.parameters():
+                param.requires_grad = True
+            # Unfreeze top encoder layers
+            num_unfrozen = getattr(config, 'num_encoder_unfrozen_layers', 2)
+            model.encoder.unfreeze_top_layers(num_unfrozen)
+            # Freeze middle model
+            for param in model.middle_model.parameters():
+                param.requires_grad = False
+            # Train prefix adapter + LayerNorm
+            for param in model.prefix_adapter.parameters():
+                param.requires_grad = True
+            for param in model.prefix_layernorm.parameters():
+                param.requires_grad = True
         trainable_params_list = [p for p in model.parameters() if p.requires_grad]
         optimizer = AdamW(trainable_params_list, lr=config.learning_rate, weight_decay=config.weight_decay)
         scaler = GradScaler(enabled=config.use_fp16)

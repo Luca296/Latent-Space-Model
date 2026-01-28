@@ -11,11 +11,12 @@ class Config:
     
     # Model dimensions
     latent_dim: int = 256
-    prefix_len: int = 50
+    prefix_len: int = 10  # Reduced from 50 for more stable training
     modernbert_hidden_dim: int = 768
     gpt2_hidden_dim: int = 768
     middle_hidden_dim: int = 512
     middle_layers: int = 3
+    num_encoder_unfrozen_layers: int = 2  # Number of top ModernBERT layers to unfreeze in Phase 2
     
     # Training hyperparameters
     learning_rate: float = 2e-5

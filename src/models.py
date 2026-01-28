@@ -16,11 +16,13 @@ from transformers import AutoModel, AutoModelForCausalLM
 class LatentEncoder(nn.Module):
     """Encoder that converts text tokens to a compact idea vector."""
     
-    def __init__(self, model_name: str, hidden_dim: int = 768, latent_dim: int = 256):
+    def __init__(self, model_name: str, hidden_dim: int = 768, latent_dim: int = 256, 
+                 num_unfrozen_layers: int = 0):
         super().__init__()
         self.modernbert = AutoModel.from_pretrained(model_name)
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.num_unfrozen_layers = num_unfrozen_layers
         
         # Compression MLP: hidden_dim -> 512 -> latent_dim
         self.compression_mlp = nn.Sequential(
@@ -29,9 +31,31 @@ class LatentEncoder(nn.Module):
             nn.Linear(512, latent_dim)
         )
         
-        # Freeze ModernBERT backbone
+        # Freeze ModernBERT backbone by default
         for param in self.modernbert.parameters():
             param.requires_grad = False
+    
+    def unfreeze_top_layers(self, num_layers: int):
+        """Unfreeze the top N transformer layers for fine-tuning."""
+        if num_layers <= 0:
+            return
+        
+        # ModernBERT uses 'encoder.layer' structure
+        if hasattr(self.modernbert, 'encoder') and hasattr(self.modernbert.encoder, 'layer'):
+            total_layers = len(self.modernbert.encoder.layer)
+            layers_to_unfreeze = list(self.modernbert.encoder.layer)[-num_layers:]
+            for layer in layers_to_unfreeze:
+                for param in layer.parameters():
+                    param.requires_grad = True
+            print(f"  - Unfroze top {num_layers} ModernBERT layers (layers {total_layers - num_layers} to {total_layers - 1})")
+        # Also try alternative structure for some models
+        elif hasattr(self.modernbert, 'layers'):
+            total_layers = len(self.modernbert.layers)
+            layers_to_unfreeze = list(self.modernbert.layers)[-num_layers:]
+            for layer in layers_to_unfreeze:
+                for param in layer.parameters():
+                    param.requires_grad = True
+            print(f"  - Unfroze top {num_layers} ModernBERT layers (layers {total_layers - num_layers} to {total_layers - 1})")
     
     def mean_pooling(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Mean pooling over non-padded tokens."""
@@ -63,10 +87,18 @@ class LatentEncoder(nn.Module):
         Returns:
             z_in: [B, latent_dim] idea vector
         """
-        # Get ModernBERT hidden states (no gradient for frozen backbone)
-        with torch.no_grad():
+        # Check if any modernbert parameters require grad (unfrozen layers)
+        has_unfrozen_layers = any(p.requires_grad for p in self.modernbert.parameters())
+        
+        if has_unfrozen_layers:
+            # Allow gradients to flow through unfrozen layers
             outputs = self.modernbert(input_ids=input_ids, attention_mask=attention_mask)
             hidden_states = outputs.last_hidden_state  # [B, L, hidden_dim]
+        else:
+            # No gradient for fully frozen backbone
+            with torch.no_grad():
+                outputs = self.modernbert(input_ids=input_ids, attention_mask=attention_mask)
+                hidden_states = outputs.last_hidden_state  # [B, L, hidden_dim]
         
         # Pool hidden states
         pooled = self.mean_pooling(hidden_states, attention_mask)  # [B, hidden_dim]
@@ -121,12 +153,16 @@ class PrefixAdapter(nn.Module):
         self.latent_dim = latent_dim
         self.prefix_len = prefix_len
         self.gpt2_hidden_dim = gpt2_hidden_dim
-        self.eps = 1e-8
         
-        # Expansion MLP: latent_dim -> prefix_len * gpt2_hidden_dim
+        # Deeper expansion MLP with no final activation
+        # This allows the output to match GPT-2's embedding distribution
+        output_dim = prefix_len * gpt2_hidden_dim
         self.expansion_mlp = nn.Sequential(
-            nn.Linear(latent_dim, prefix_len * gpt2_hidden_dim),
-            nn.GELU()
+            nn.Linear(latent_dim, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 2048),
+            nn.GELU(),
+            nn.Linear(2048, output_dim)  # No activation at the end!
         )
     
     def forward(self, z_out: torch.Tensor) -> torch.Tensor:
@@ -141,11 +177,8 @@ class PrefixAdapter(nn.Module):
         """
         batch_size = z_out.size(0)
         
-        # Normalize latent vector before expansion (stabilizes norm distribution)
-        z_norm = z_out / (torch.norm(z_out, dim=-1, keepdim=True) + self.eps)
-        
-        # Expand to prefix dimensions
-        expanded = self.expansion_mlp(z_norm)  # [B, prefix_len * gpt2_hidden_dim]
+        # Direct expansion without L2 normalization (preserves magnitude information)
+        expanded = self.expansion_mlp(z_out)  # [B, prefix_len * gpt2_hidden_dim]
         
         # Reshape to prefix embeddings
         prefix_embeddings = expanded.view(batch_size, self.prefix_len, self.gpt2_hidden_dim)
@@ -175,7 +208,8 @@ class LatentSpaceModel(nn.Module):
         self.encoder = LatentEncoder(
             model_name=config.modernbert_model,
             hidden_dim=config.modernbert_hidden_dim,
-            latent_dim=config.latent_dim
+            latent_dim=config.latent_dim,
+            num_unfrozen_layers=getattr(config, 'num_encoder_unfrozen_layers', 0)
         )
         
         self.middle_model = MiddleModel(

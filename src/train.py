@@ -40,6 +40,10 @@ from src.config import Config
 
 # --- Common Functions ---
 
+# GPT-2 pad token ID (eos_token used as pad)
+GPT2_PAD_TOKEN_ID = 50256
+
+
 def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor, 
                  target_attention_mask: torch.Tensor) -> torch.Tensor:
     """Compute cross-entropy loss for decoder outputs."""
@@ -55,7 +59,8 @@ def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor,
     target_ids_flat = target_ids_to_predict.reshape(-1)
     target_mask_flat = target_mask_to_predict.reshape(-1)
     
-    loss_fct = nn.CrossEntropyLoss(ignore_index=0, reduction='none')
+    # Use correct GPT-2 pad token ID (50256), not 0
+    loss_fct = nn.CrossEntropyLoss(ignore_index=GPT2_PAD_TOKEN_ID, reduction='none')
     loss_per_token = loss_fct(logits_flat, target_ids_flat)
     loss_per_token = loss_per_token * target_mask_flat.float()
     loss = loss_per_token.sum() / torch.clamp(target_mask_flat.sum(), min=1e-9)
@@ -437,9 +442,12 @@ def train(config: Config):
     if test_mode == 'identity_task':
         print("Creating identity task dataloaders...")
         train_loader, val_loader = create_identity_dataloaders(config)
-    elif test_mode == 'phase1_decoder' or test_mode == 'phase2_encoder':
-        print("Creating Phase 1/2 dataloaders (Identity SAMSum)...")
+    elif test_mode == 'phase1_decoder':
+        print("Creating Phase 1 dataloaders (Identity SAMSum)...")
         train_loader, val_loader = create_phase1_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
+    elif test_mode == 'phase2_encoder':
+        print("Creating Phase 2 dataloaders (Actual SAMSum summarization)...")
+        train_loader, val_loader = create_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
     else:
         print("Creating dataloaders...")
         train_loader, val_loader = create_dataloaders(config, train_samples=config.max_train_samples, val_samples=1000)
@@ -513,6 +521,10 @@ def train(config: Config):
         for param in model.encoder.compression_mlp.parameters():
             param.requires_grad = True
         print("  - Trainable: encoder.compression_mlp")
+        
+        # Unfreeze top N ModernBERT layers for better gradient flow
+        num_unfrozen = getattr(config, 'num_encoder_unfrozen_layers', 2)
+        model.encoder.unfreeze_top_layers(num_unfrozen)
 
         # Freeze middle model
         for param in model.middle_model.parameters():
