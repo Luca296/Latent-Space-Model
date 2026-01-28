@@ -490,7 +490,14 @@ def train(config: Config):
         checkpoint_path = Path(config.checkpoint_dir) / "best_model.pt"
         if checkpoint_path.exists():
             print(f"Loading Phase 1 checkpoint from {checkpoint_path}...")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            # Use weights_only=False to allow loading the Config object
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            
+            # Backup Phase 1 model
+            backup_path = Path(config.checkpoint_dir) / "best_model_phase1.pt"
+            print(f"Backing up Phase 1 model to {backup_path}...")
+            torch.save(checkpoint, backup_path)
+            
             # strict=False because we might be modifying architecture in future or backward compatibility
             # In this exact flow, keys should match.
             model.load_state_dict(checkpoint["model_state_dict"], strict=True)
