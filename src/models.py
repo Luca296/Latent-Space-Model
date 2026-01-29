@@ -353,7 +353,7 @@ class LatentSpaceModel(nn.Module):
             eos_token_id: End of sequence token ID
             
         Returns:
-            generated_ids: [B, max_length] generated token IDs
+            generated_ids: [B, seq_len] generated token IDs (padded to max_length)
         """
         batch_size = input_ids.size(0)
         device = input_ids.device
@@ -364,15 +364,14 @@ class LatentSpaceModel(nn.Module):
         # Get prefix embeddings
         prefix_embeddings = self.get_prefix_embeddings(z_out)  # [B, prefix_len, gpt2_hidden_dim]
         
-        # Start with BOS token
+        # Get EOS token ID
         if eos_token_id is None:
             eos_token_id = self.gpt2.config.eos_token_id
         
         # Initialize generation with prefix
         current_embeds = prefix_embeddings
-        current_length = self.config.prefix_len
-        
-        generated_ids = torch.zeros(batch_size, max_length, dtype=torch.long, device=device)
+        generated_ids_list = []  # List to collect generated tokens
+        has_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)  # Track which sequences have hit EOS
         
         for i in range(max_length):
             # Run GPT-2 on current embeddings
@@ -410,11 +409,13 @@ class LatentSpaceModel(nn.Module):
             else:
                 next_token = torch.argmax(logits, dim=-1)
             
-            generated_ids[:, i] = next_token
+            # Store generated token
+            generated_ids_list.append(next_token)
             
-            # Check for EOS
-            if (next_token == eos_token_id).all():
-                generated_ids = generated_ids[:, :i+1]
+            # Check for EOS and stop early if all sequences have generated EOS
+            is_eos = next_token == eos_token_id
+            has_eos = has_eos | is_eos
+            if has_eos.all():
                 break
             
             # Get embedding for next token and append
@@ -423,5 +424,11 @@ class LatentSpaceModel(nn.Module):
             model_dtype = next(self.gpt2.parameters()).dtype
             next_token_embed = next_token_embed.to(model_dtype)
             current_embeds = torch.cat([current_embeds, next_token_embed], dim=1)
+        
+        # Stack generated tokens into tensor [B, seq_len]
+        if generated_ids_list:
+            generated_ids = torch.stack(generated_ids_list, dim=1)  # [B, seq_len]
+        else:
+            generated_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         
         return generated_ids

@@ -31,8 +31,8 @@ class Config:
     gpt2_model: str = "google/gemma-3-270m-it"  # Gemma 3 270M (efficient decoder)
     
     # Training settings
-    num_epochs: int = 30
-    warmup_steps: int = 100
+    num_epochs: int = 50  # Increased from 30 for better convergence
+    warmup_steps: int = 200  # Increased from 100 for better learning rate schedule
     weight_decay: float = 0.01
     
     # Device settings
