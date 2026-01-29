@@ -281,6 +281,11 @@ class LatentSpaceModel(nn.Module):
         target_input_ids = target_ids[:, :-1]  # [B, T-1]
         target_embeddings = self.gpt2_embeddings(target_input_ids)  # [B, T-1, gpt2_hidden_dim]
         
+        # Cast all embeddings to match decoder model dtype (handles BFloat16, Float16, etc.)
+        model_dtype = next(self.gpt2.parameters()).dtype
+        prefix_embeddings = prefix_embeddings.to(model_dtype)
+        target_embeddings = target_embeddings.to(model_dtype)
+        
         # Concatenate prefix and target embeddings
         input_embeds = torch.cat([prefix_embeddings, target_embeddings], dim=1)  # [B, prefix_len + T-1, gpt2_hidden_dim]
         
@@ -318,7 +323,10 @@ class LatentSpaceModel(nn.Module):
     def get_prefix_embeddings(self, z_out: torch.Tensor) -> torch.Tensor:
         """Get prefix embeddings from latent vector (for inference)."""
         prefix_embeddings = self.prefix_adapter(z_out)
-        return self.prefix_layernorm(prefix_embeddings)
+        prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
+        # Cast to decoder model dtype (handles BFloat16, Float16, etc.)
+        model_dtype = next(self.gpt2.parameters()).dtype
+        return prefix_embeddings.to(model_dtype)
     
     def generate(
         self,
@@ -411,6 +419,9 @@ class LatentSpaceModel(nn.Module):
             
             # Get embedding for next token and append
             next_token_embed = self.gpt2_embeddings(next_token).unsqueeze(1)  # [B, 1, gpt2_hidden_dim]
+            # Cast to decoder model dtype (handles BFloat16, Float16, etc.)
+            model_dtype = next(self.gpt2.parameters()).dtype
+            next_token_embed = next_token_embed.to(model_dtype)
             current_embeds = torch.cat([current_embeds, next_token_embed], dim=1)
         
         return generated_ids
