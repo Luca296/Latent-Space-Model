@@ -40,8 +40,8 @@ from src.config import Config
 
 # --- Common Functions ---
 
-# GPT-2 pad token ID (eos_token used as pad)
-GPT2_PAD_TOKEN_ID = 50256
+# Decoder pad token ID (use PyTorch's default ignore index)
+DECODER_PAD_TOKEN_ID = -100
 
 
 def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor, 
@@ -59,8 +59,8 @@ def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor,
     target_ids_flat = target_ids_to_predict.reshape(-1)
     target_mask_flat = target_mask_to_predict.reshape(-1)
     
-    # Use correct GPT-2 pad token ID (50256), not 0
-    loss_fct = nn.CrossEntropyLoss(ignore_index=GPT2_PAD_TOKEN_ID, reduction='none')
+    # Use PyTorch default ignore index (-100) which handles variable vocab sizes
+    loss_fct = nn.CrossEntropyLoss(ignore_index=DECODER_PAD_TOKEN_ID, reduction='none')
     loss_per_token = loss_fct(logits_flat, target_ids_flat)
     loss_per_token = loss_per_token * target_mask_flat.float()
     loss = loss_per_token.sum() / torch.clamp(target_mask_flat.sum(), min=1e-9)

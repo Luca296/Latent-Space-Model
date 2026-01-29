@@ -31,7 +31,7 @@ class SAMSumDataset(Dataset):
         self.modernbert_tokenizer = AutoTokenizer.from_pretrained(modernbert_tokenizer_name)
         self.gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_tokenizer_name)
         
-        # Add pad token to GPT-2 if not present
+        # Add pad token to decoder tokenizer if not present
         if self.gpt2_tokenizer.pad_token is None:
             self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
         
@@ -105,7 +105,7 @@ class SAMSumIdentityDataset(Dataset):
         self.modernbert_tokenizer = AutoTokenizer.from_pretrained(modernbert_tokenizer_name)
         self.gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_tokenizer_name)
 
-        # Add pad token to GPT-2 if not present
+        # Add pad token to decoder tokenizer if not present
         if self.gpt2_tokenizer.pad_token is None:
             self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
 
@@ -329,7 +329,7 @@ class IdentityDataset(Dataset):
         self.modernbert_tokenizer = AutoTokenizer.from_pretrained(modernbert_tokenizer_name)
         self.gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_tokenizer_name)
         
-        # Add pad token to GPT-2 if not present
+        # Add pad token to decoder tokenizer if not present
         if self.gpt2_tokenizer.pad_token is None:
             self.gpt2_tokenizer.pad_token = self.gpt2_tokenizer.eos_token
         

@@ -13,7 +13,7 @@ class Config:
     latent_dim: int = 256
     prefix_len: int = 10  # Reduced from 50 for more stable training
     modernbert_hidden_dim: int = 768
-    gpt2_hidden_dim: int = 768
+    gpt2_hidden_dim: int = 640  # Gemma-3-270m hidden dimension
     middle_hidden_dim: int = 512
     middle_layers: int = 3
     num_encoder_unfrozen_layers: int = 2  # Number of top ModernBERT layers to unfreeze in Phase 2
@@ -28,7 +28,7 @@ class Config:
     
     # Model names
     modernbert_model: str = "answerdotai/ModernBERT-base"  # Base is the standard/small option
-    gpt2_model: str = "gpt2"  # This is GPT-2 Small (117M parameters)
+    gpt2_model: str = "google/gemma-3-270m-it"  # Gemma 3 270M (efficient decoder)
     
     # Training settings
     num_epochs: int = 30

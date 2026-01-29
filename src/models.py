@@ -233,8 +233,14 @@ class LatentSpaceModel(nn.Module):
         for param in self.gpt2.parameters():
             param.requires_grad = False
         
-        # Get GPT-2 token embeddings for teacher forcing
-        self.gpt2_embeddings = self.gpt2.transformer.wte
+        # Get decoder token embeddings for teacher forcing
+        # Handle both GPT-2 style (transformer.wte) and Gemma style (model.embed_tokens)
+        if hasattr(self.gpt2, 'transformer') and hasattr(self.gpt2.transformer, 'wte'):
+            self.gpt2_embeddings = self.gpt2.transformer.wte  # GPT-2 style
+        elif hasattr(self.gpt2, 'model') and hasattr(self.gpt2.model, 'embed_tokens'):
+            self.gpt2_embeddings = self.gpt2.model.embed_tokens  # Gemma style
+        else:
+            raise RuntimeError("Could not find embedding layer in decoder model. Check model architecture.")
     
     def forward(
         self,
