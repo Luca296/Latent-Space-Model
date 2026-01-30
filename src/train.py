@@ -95,6 +95,65 @@ def cleanup_checkpoints(config: Config, best_model_saved: bool):
     return
 
 
+def find_latest_checkpoint(config: Config):
+    """Find the latest checkpoint by step number."""
+    checkpoint_dir = Path(config.checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+    
+    checkpoints = list(checkpoint_dir.glob("checkpoint_step_*.pt"))
+    if not checkpoints:
+        return None
+    
+    # Sort by step number (extract from filename)
+    checkpoints_with_steps = []
+    for ckpt in checkpoints:
+        try:
+            step = int(ckpt.stem.split("_")[-1])
+            checkpoints_with_steps.append((step, ckpt))
+        except (ValueError, IndexError):
+            continue
+    
+    if not checkpoints_with_steps:
+        return None
+    
+    # Return the checkpoint with the highest step number
+    latest_step, latest_path = max(checkpoints_with_steps, key=lambda x: x[0])
+    return latest_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scaler, device, config):
+    """Load a checkpoint and return the starting epoch and step."""
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    # Use weights_only=False to allow loading the Config object
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Load model state
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    print("  - Model state loaded")
+    
+    # Load optimizer state
+    if "optimizer_state_dict" in checkpoint and optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print("  - Optimizer state loaded")
+    
+    # Load scaler state (for mixed precision training)
+    if "scaler_state_dict" in checkpoint and scaler is not None:
+        try:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            print("  - Scaler state loaded")
+        except Exception as e:
+            print(f"  - Warning: Could not load scaler state: {e}")
+    
+    # Get the step and epoch to resume from
+    start_step = checkpoint.get("step", 0)
+    start_epoch = checkpoint.get("epoch", 0)
+    
+    print(f"Resuming from epoch {start_epoch}, step {start_step}")
+    
+    return start_epoch, start_step
+
+
 # --- TUI Logic ---
 
 class TrainingDashboard:
@@ -193,7 +252,7 @@ class TrainingDashboard:
         self.current_step = step
 
 
-def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch, dashboard):
+def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch, dashboard, start_step=0):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -203,6 +262,10 @@ def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch,
     optimizer.zero_grad()
     
     for step, batch in enumerate(dataloader):
+        # Skip batches if resuming from a checkpoint mid-epoch
+        if step < start_step:
+            continue
+            
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         target_ids = batch["target_ids"].to(device)
@@ -263,22 +326,24 @@ def validate_tui(model, dataloader, device, config, dashboard):
     dashboard.progress_group.remove_task(val_task)
     return total_loss / num_batches
 
-def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device) -> bool:
+def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0) -> bool:
     dashboard = TrainingDashboard(config)
     best_model_saved = False
     # Ensure epoch progress bar matches total epochs
     dashboard.progress_group.reset(dashboard.epoch_task)
-    dashboard.progress_group.update(dashboard.epoch_task, total=config.num_epochs, completed=0)
+    dashboard.progress_group.update(dashboard.epoch_task, total=config.num_epochs, completed=start_epoch)
     with Live(dashboard.layout, refresh_per_second=4, screen=True) as live:
         def update_view():
             dashboard.update_display()
             live.update(dashboard.layout)
             
         dashboard.log("Starting training with TUI...")
+        if start_epoch > 0 or start_step > 0:
+            dashboard.log(f"[yellow]Resuming from epoch {start_epoch}, step {start_step}[/]")
         update_view()
         
-        for epoch in range(config.num_epochs):
-            train_loss = train_epoch_tui(model, train_loader, optimizer, scaler, device, config, epoch, dashboard)
+        for epoch in range(start_epoch, config.num_epochs):
+            train_loss = train_epoch_tui(model, train_loader, optimizer, scaler, device, config, epoch, dashboard, start_step if epoch == start_epoch else 0)
             dashboard.log(f"Epoch {epoch+1} Train Loss: {train_loss:.4f}")
             
             val_loss = validate_tui(model, val_loader, device, config, dashboard)
@@ -292,6 +357,10 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
                 best_model_path = checkpoint_dir / "best_model.pt"
                 torch.save({
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "epoch": epoch,
+                    "step": start_step,
                     "config": config
                 }, best_model_path, _use_new_zipfile_serialization=False)
                 best_model_saved = True
@@ -307,7 +376,7 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
 
 # --- Simple (No-TUI) Logic ---
 
-def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epoch):
+def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epoch, start_step=0):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -315,6 +384,11 @@ def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epo
     
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
+        # Skip batches if resuming from a checkpoint mid-epoch
+        if step < start_step:
+            progress_bar.update(1)
+            continue
+            
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         target_ids = batch["target_ids"].to(device)
@@ -365,13 +439,15 @@ def validate_simple(model, dataloader, device, config):
             num_batches += 1
     return total_loss / num_batches
 
-def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device) -> bool:
+def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0) -> bool:
     print("Starting training (Simple Mode)...")
+    if start_epoch > 0 or start_step > 0:
+        print(f"Resuming from epoch {start_epoch}, step {start_step}...")
     best_val_loss = float("inf")
     best_model_saved = False
     
-    for epoch in range(config.num_epochs):
-        train_loss = train_epoch_simple(model, train_loader, optimizer, scaler, device, config, epoch)
+    for epoch in range(start_epoch, config.num_epochs):
+        train_loss = train_epoch_simple(model, train_loader, optimizer, scaler, device, config, epoch, start_step if epoch == start_epoch else 0)
         print(f"Epoch {epoch+1}/{config.num_epochs} - Train Loss: {train_loss:.4f}")
         
         val_loss = validate_simple(model, val_loader, device, config)
@@ -384,6 +460,10 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
             best_model_path = checkpoint_dir / "best_model.pt"
             torch.save({
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "epoch": epoch,
+                "step": start_step,
                 "config": config
             }, best_model_path, _use_new_zipfile_serialization=False)
             best_model_saved = True
@@ -547,10 +627,22 @@ def train(config: Config):
     optimizer = AdamW(trainable_params_list, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler(enabled=config.use_fp16)
     
+    # Find and load latest checkpoint if it exists
+    start_epoch = 0
+    start_step = 0
+    latest_checkpoint = find_latest_checkpoint(config)
+    if latest_checkpoint:
+        try:
+            start_epoch, start_step = load_checkpoint(latest_checkpoint, model, optimizer, scaler, device, config)
+            print()
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print("Starting from scratch...")
+    
     if config.use_tui:
-        best_model_saved = run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device)
+        best_model_saved = run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step)
     else:
-        best_model_saved = run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device)
+        best_model_saved = run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step)
 
     # Cleanup logic
     cleanup_checkpoints(config, best_model_saved)
