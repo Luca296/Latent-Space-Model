@@ -543,7 +543,7 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
         z_in = batch[target_key].to(device)
-        z_in, z_target = append_stop_latent_to_latent_batch(z_in, z_in, model)
+        z_target = z_in
         with autocast(enabled=config.use_fp16):
             z_out = model.middle_model(z_in)
             loss = compute_latent_loss(z_out, z_target, config)
@@ -602,7 +602,7 @@ def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, co
     return total_loss / max(1, num_batches)
 
 
-def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, epoch, use_middle: bool, is_summary: bool = False):
+def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, epoch, use_middle: bool, is_summary: bool = False, use_stop_latent: bool = False):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -619,12 +619,13 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
             target_ids = batch["target_ids"].to(device)
             target_attention = batch["target_attention_mask"].to(device)
 
-        z_in, target_ids, target_attention = append_stop_latent_to_decoder_batch(
-            z_in,
-            target_ids,
-            target_attention,
-            model
-        )
+        if use_stop_latent:
+            z_in, target_ids, target_attention = append_stop_latent_to_decoder_batch(
+                z_in,
+                target_ids,
+                target_attention,
+                model
+            )
 
         with autocast(enabled=config.use_fp16):
             logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
@@ -725,11 +726,7 @@ def train(config: Config):
             for param in model.middle_model.parameters():
                 param.requires_grad = True
 
-            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
-            original_num_workers = config.num_workers
-            config.num_workers = 0
-            train_loader = create_pretrain_middle_dataloaders(config, cache_paths, model=model)
-            config.num_workers = original_num_workers
+            train_loader = create_pretrain_middle_dataloaders(config, cache_paths)
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
             for epoch in range(config.pretrain_middle_epochs):
@@ -746,10 +743,7 @@ def train(config: Config):
             for param in model.prefix_layernorm.parameters():
                 param.requires_grad = True
 
-            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
-            config.num_workers = 0
-            adapter_loader = create_pretrain_adapter_dataloader(config, cache_paths, model=model)
-            config.num_workers = original_num_workers
+            adapter_loader = create_pretrain_adapter_dataloader(config, cache_paths)
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
             for epoch in range(config.pretrain_adapter_epochs):
@@ -762,7 +756,8 @@ def train(config: Config):
                     config,
                     epoch,
                     use_middle=getattr(config, "adapter_pretrain_use_middle", False),
-                    is_summary=False
+                    is_summary=False,
+                    use_stop_latent=False
                 )
                 print(f"Adapter Pretrain Epoch {epoch+1}: loss={loss:.4f}")
 
@@ -829,7 +824,8 @@ def train(config: Config):
                     config,
                     epoch,
                     use_middle=True,
-                    is_summary=True
+                    is_summary=True,
+                    use_stop_latent=True
                 )
                 val_loss = validate_adapter_epoch(model, finetune_val_loader, device, config, use_middle=True)
                 print(f"Adapter Fine-tune Epoch {epoch+1}: loss={loss:.4f} | val_loss={val_loss:.4f}")

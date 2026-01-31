@@ -953,19 +953,19 @@ def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
     # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
     if model is not None and getattr(config, "use_stop_latent", True):
         batch_size = ideas.size(0)
-        stop_latent = model.get_stop_latent(batch_size=batch_size, device=ideas.device)
+        stop_latent = model.get_stop_latent(device=ideas.device)
         eos_token_id = model.gpt2.config.eos_token_id
         
-        # Append STOP_LATENT to ideas
-        ideas = torch.cat([ideas, stop_latent], dim=0)
+        # Append STOP_LATENT to ideas (1 sample for STOP_LATENT)
+        ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
         
-        # Append EOS targets
-        eos_targets = torch.full((batch_size, 1), fill_value=eos_token_id, dtype=target_ids.dtype, device=target_ids.device)
-        target_ids = torch.cat([target_ids, eos_targets], dim=1)
+        # Create target for STOP_LATENT sample: sequence of all EOS tokens
+        eos_target = torch.full((1, target_ids.size(1)), fill_value=eos_token_id, dtype=target_ids.dtype, device=target_ids.device)
+        target_ids = torch.cat([target_ids, eos_target], dim=0)
         
-        # Append attention for EOS
-        eos_attention = torch.ones((batch_size, 1), dtype=target_attention_mask.dtype, device=target_attention_mask.device)
-        target_attention_mask = torch.cat([target_attention_mask, eos_attention], dim=1)
+        # Create attention for STOP_LATENT sample: all ones (all valid)
+        eos_attention = torch.ones((1, target_attention_mask.size(1)), dtype=target_attention_mask.dtype, device=target_attention_mask.device)
+        target_attention_mask = torch.cat([target_attention_mask, eos_attention], dim=0)
     
     return {
         "idea": ideas,
@@ -982,21 +982,20 @@ def collate_cached_pairs(batch: list, model = None, config = None) -> dict:
     
     # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
     if model is not None and getattr(config, "use_stop_latent", True):
-        batch_size = source_ideas.size(0)
-        stop_latent = model.get_stop_latent(batch_size=batch_size, device=source_ideas.device)
+        stop_latent = model.get_stop_latent(device=source_ideas.device)
         eos_token_id = model.gpt2.config.eos_token_id
         
-        # Append STOP_LATENT to both source and target ideas
-        source_ideas = torch.cat([source_ideas, stop_latent], dim=0)
-        target_ideas = torch.cat([target_ideas, stop_latent], dim=0)
+        # Append STOP_LATENT to both source and target ideas (1 sample)
+        source_ideas = torch.cat([source_ideas, stop_latent.unsqueeze(0)], dim=0)
+        target_ideas = torch.cat([target_ideas, stop_latent.unsqueeze(0)], dim=0)
         
-        # Append EOS targets to summary_ids
-        eos_targets = torch.full((batch_size, 1), fill_value=eos_token_id, dtype=summary_ids.dtype, device=summary_ids.device)
-        summary_ids = torch.cat([summary_ids, eos_targets], dim=1)
+        # Create target for STOP_LATENT sample: sequence of all EOS tokens
+        eos_target = torch.full((1, summary_ids.size(1)), fill_value=eos_token_id, dtype=summary_ids.dtype, device=summary_ids.device)
+        summary_ids = torch.cat([summary_ids, eos_target], dim=0)
         
-        # Append attention for EOS
-        eos_attention = torch.ones((batch_size, 1), dtype=summary_attention_mask.dtype, device=summary_attention_mask.device)
-        summary_attention_mask = torch.cat([summary_attention_mask, eos_attention], dim=1)
+        # Create attention for STOP_LATENT sample: all ones (all valid)
+        eos_attention = torch.ones((1, summary_attention_mask.size(1)), dtype=summary_attention_mask.dtype, device=summary_attention_mask.device)
+        summary_attention_mask = torch.cat([summary_attention_mask, eos_attention], dim=0)
     
     return {
         "source_idea": source_ideas,

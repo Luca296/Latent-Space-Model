@@ -77,8 +77,8 @@ class Config:
     wikitext_split: str = "train"
     arxiv_split: str = "train"
     english_pretrain_split: str = "train"
-    wikitext_max_samples: int = 150000
-    arxiv_max_samples: int = 100000
+    wikitext_max_samples: int = 500000
+    arxiv_max_samples: int = 500000
     english_pretrain_max_samples: int = None
 
     # Preprocessing / caching
