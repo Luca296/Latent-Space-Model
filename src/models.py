@@ -242,12 +242,12 @@ class LatentSpaceModel(nn.Module):
         # Load GPT-2 for decoding
         self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
 
-        # Fixed STOP latent vector
+        # Fixed STOP latent vector (float16)
         stop_latent = _init_stop_latent(
             latent_dim=config.latent_dim,
             init=getattr(config, "stop_latent_init", "random_normalized"),
             seed=getattr(config, "stop_latent_seed", 1337)
-        )
+        ).to(dtype=torch.float16)
         self.register_buffer("STOP_LATENT", stop_latent)
         
         # Freeze GPT-2 backbone

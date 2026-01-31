@@ -62,6 +62,7 @@ def append_stop_latent_to_latent_batch(
     model: LatentSpaceModel
 ) -> tuple[torch.Tensor, torch.Tensor]:
     stop_latent = model.get_stop_latent(batch_size=z_in.size(0), device=z_in.device)
+    stop_latent = stop_latent.to(dtype=z_in.dtype)
     z_in_aug = torch.cat([z_in, stop_latent], dim=0)
     z_target_aug = torch.cat([z_target, stop_latent], dim=0)
     return z_in_aug, z_target_aug
@@ -75,6 +76,7 @@ def append_stop_latent_to_decoder_batch(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, seq_len = target_ids.size()
     stop_latent = model.get_stop_latent(batch_size=batch_size, device=z_in.device)
+    stop_latent = stop_latent.to(dtype=z_in.dtype)
     eos_token_id = model.gpt2.config.eos_token_id
 
     eos_targets = torch.full_like(target_ids, fill_value=eos_token_id)
@@ -542,7 +544,7 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
 
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
-        z_in = batch[target_key].to(device)
+        z_in = batch[target_key].to(device, dtype=torch.float16)
         z_target = z_in
         with autocast(enabled=config.use_fp16):
             z_out = model.middle_model(z_in)
@@ -575,8 +577,8 @@ def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, co
 
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
-        source_idea = batch["source_idea"].to(device)
-        target_idea = batch["target_idea"].to(device)
+        source_idea = batch["source_idea"].to(device, dtype=torch.float16)
+        target_idea = batch["target_idea"].to(device, dtype=torch.float16)
         source_idea, target_idea = append_stop_latent_to_latent_batch(source_idea, target_idea, model)
 
         with autocast(enabled=config.use_fp16):
@@ -611,11 +613,11 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
         if is_summary:
-            z_in = batch["source_idea"].to(device)
+            z_in = batch["source_idea"].to(device, dtype=torch.float16)
             target_ids = batch["summary_ids"].to(device)
             target_attention = batch["summary_attention_mask"].to(device)
         else:
-            z_in = batch["idea"].to(device)
+            z_in = batch["idea"].to(device, dtype=torch.float16)
             target_ids = batch["target_ids"].to(device)
             target_attention = batch["target_attention_mask"].to(device)
 

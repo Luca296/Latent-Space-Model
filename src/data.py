@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Iterable, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from transformers import AutoTokenizer
@@ -499,6 +500,27 @@ def _mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> 
     return sum_embeddings / sum_mask
 
 
+def _to_float16_list(tensor: torch.Tensor) -> list:
+    return tensor.detach().cpu().numpy().astype(np.float16).tolist()
+
+
+def _quantize_int8(tensor: torch.Tensor) -> tuple[list, float]:
+    emb = tensor.detach().cpu().numpy().astype(np.float16)
+    if emb.size == 0:
+        return [], 1.0
+    max_abs = float(np.max(np.abs(emb)))
+    scale = max_abs / 127.0 if max_abs > 0 else 1.0
+    emb_q = np.clip(np.round(emb / scale), -127, 127).astype(np.int8)
+    return emb_q.tolist(), float(scale)
+
+
+def _dequantize_int8(emb_q: list, scale: float) -> np.ndarray:
+    if scale is None or scale == 0:
+        scale = 1.0
+    emb_q_arr = np.array(emb_q, dtype=np.int8)
+    return (emb_q_arr.astype(np.float16) * np.float16(scale)).astype(np.float16)
+
+
 def _extract_field(item: dict, candidates: Iterable[str]) -> Optional[str]:
     for key in candidates:
         value = item.get(key, None)
@@ -592,8 +614,20 @@ def preprocess_and_cache_datasets(config) -> dict:
             progress.update(task_id, **kwargs)
 
     def _finish_task(task_id, description: str):
-        task = progress.get_task(task_id)
-        _safe_update(task_id, description=description, completed=task.total)
+        # Mark task completed; try public API first, fall back to internal structures
+        with progress_lock:
+            try:
+                task = progress.get_task(task_id)
+                total = task.total
+            except Exception:
+                try:
+                    total = progress.tasks[task_id].total
+                except Exception:
+                    total = None
+            if total is not None:
+                progress.update(task_id, description=description, completed=total)
+            else:
+                progress.update(task_id, description=description)
 
     def _prepare_task(output_path: Path, label: str):
         with progress_lock:
@@ -612,19 +646,19 @@ def preprocess_and_cache_datasets(config) -> dict:
         if output_path.exists():
             cached_rows = _jsonl_line_count(output_path)
             if expected_rows > 0 and cached_rows >= expected_rows:
-                _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+                _safe_update(task_id, total=expected_rows, completed=expected_rows, description=f"[green]Cached {output_path.name} (skipped)")
                 return
             _safe_update(
                 task_id,
-                total=1,
-                completed=0,
+                total=expected_rows or len(dataset),
+                completed=cached_rows,
                 description=f"[yellow]Cached {output_path.name} incomplete ({cached_rows}/{expected_rows}); regenerating"
             )
 
         rows = []
         batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
-        total_batches = (len(dataset) + batch_size - 1) // batch_size
-        _safe_update(task_id, total=total_batches, completed=0, description=f"{label}: {output_path.name}")
+        total_samples = len(dataset)
+        _safe_update(task_id, total=total_samples, completed=0, description=f"{label}: {output_path.name}")
 
         for start in range(0, len(dataset), batch_size):
             batch = dataset[start : start + batch_size]
@@ -638,7 +672,8 @@ def preprocess_and_cache_datasets(config) -> dict:
                 if text:
                     texts.append(text)
             if not texts:
-                _safe_update(task_id, advance=1)
+                # advance by zero samples (no valid texts in this batch)
+                _safe_update(task_id, advance=0)
                 continue
 
             input_enc = modernbert_tokenizer(
@@ -666,16 +701,25 @@ def preprocess_and_cache_datasets(config) -> dict:
                 ideas = encoder.compression_mlp(pooled)
 
             for i in range(len(texts)):
+                embedding_fp16 = _to_float16_list(pooled[i])
+                idea_fp16 = _to_float16_list(ideas[i])
+                embedding_q, embedding_scale = _quantize_int8(pooled[i])
+                idea_q, idea_scale = _quantize_int8(ideas[i])
                 rows.append({
                     "text": texts[i],
                     "input_ids": input_enc["input_ids"][i].tolist(),
                     "attention_mask": input_enc["attention_mask"][i].tolist(),
                     "target_ids": target_enc["input_ids"][i].tolist(),
                     "target_attention_mask": target_enc["attention_mask"][i].tolist(),
-                    "embedding": pooled[i].cpu().tolist(),
-                    "idea": ideas[i].cpu().tolist()
+                    "embedding": embedding_fp16,
+                    "embedding_q": embedding_q,
+                    "embedding_scale": embedding_scale,
+                    "idea": idea_fp16,
+                    "idea_q": idea_q,
+                    "idea_scale": idea_scale
                 })
-            _safe_update(task_id, advance=1)
+            # advance progress by number of samples processed in this batch
+            _safe_update(task_id, advance=len(texts))
 
         _write_jsonl(output_path, rows)
         _finish_task(task_id, f"[green]Cached {output_path.name}")
@@ -684,25 +728,25 @@ def preprocess_and_cache_datasets(config) -> dict:
         if output_path.exists():
             cached_rows = _jsonl_line_count(output_path)
             if expected_rows > 0 and cached_rows >= expected_rows:
-                _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+                _safe_update(task_id, total=expected_rows, completed=expected_rows, description=f"[green]Cached {output_path.name} (skipped)")
                 return
             _safe_update(
                 task_id,
-                total=1,
-                completed=0,
+                total=expected_rows or len(dataset),
+                completed=cached_rows,
                 description=f"[yellow]Cached {output_path.name} incomplete ({cached_rows}/{expected_rows}); regenerating"
             )
 
         rows = []
         batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
-        total_batches = (len(dataset) + batch_size - 1) // batch_size
-        _safe_update(task_id, total=total_batches, completed=0, description=f"{label}: {output_path.name}")
+        total_samples = len(dataset)
+        _safe_update(task_id, total=total_samples, completed=0, description=f"{label}: {output_path.name}")
 
         for start in range(0, len(dataset), batch_size):
             batch = dataset[start : start + batch_size]
             sources, targets = [], []
             if "source" not in batch or "target" not in batch:
-                _safe_update(task_id, advance=1)
+                _safe_update(task_id, advance=0)
                 continue
             for i in range(len(batch["source"])):
                 source = batch["source"][i]
@@ -712,7 +756,7 @@ def preprocess_and_cache_datasets(config) -> dict:
                     targets.append(target)
 
             if not sources:
-                _safe_update(task_id, advance=1)
+                _safe_update(task_id, advance=0)
                 continue
 
             source_enc = modernbert_tokenizer(
@@ -759,6 +803,14 @@ def preprocess_and_cache_datasets(config) -> dict:
                 target_ideas = encoder.compression_mlp(target_pooled)
 
             for i in range(len(sources)):
+                source_embedding_fp16 = _to_float16_list(source_pooled[i])
+                target_embedding_fp16 = _to_float16_list(target_pooled[i])
+                source_idea_fp16 = _to_float16_list(source_ideas[i])
+                target_idea_fp16 = _to_float16_list(target_ideas[i])
+                source_embedding_q, source_embedding_scale = _quantize_int8(source_pooled[i])
+                target_embedding_q, target_embedding_scale = _quantize_int8(target_pooled[i])
+                source_idea_q, source_idea_scale = _quantize_int8(source_ideas[i])
+                target_idea_q, target_idea_scale = _quantize_int8(target_ideas[i])
                 rows.append({
                     "source": sources[i],
                     "target": targets[i],
@@ -770,12 +822,21 @@ def preprocess_and_cache_datasets(config) -> dict:
                     "target_attention_mask": target_enc["attention_mask"][i].tolist(),
                     "target_target_ids": target_target_enc["input_ids"][i].tolist(),
                     "target_target_attention_mask": target_target_enc["attention_mask"][i].tolist(),
-                    "source_embedding": source_pooled[i].cpu().tolist(),
-                    "target_embedding": target_pooled[i].cpu().tolist(),
-                    "source_idea": source_ideas[i].cpu().tolist(),
-                    "target_idea": target_ideas[i].cpu().tolist()
+                    "source_embedding": source_embedding_fp16,
+                    "source_embedding_q": source_embedding_q,
+                    "source_embedding_scale": source_embedding_scale,
+                    "target_embedding": target_embedding_fp16,
+                    "target_embedding_q": target_embedding_q,
+                    "target_embedding_scale": target_embedding_scale,
+                    "source_idea": source_idea_fp16,
+                    "source_idea_q": source_idea_q,
+                    "source_idea_scale": source_idea_scale,
+                    "target_idea": target_idea_fp16,
+                    "target_idea_q": target_idea_q,
+                    "target_idea_scale": target_idea_scale
                 })
-            _safe_update(task_id, advance=1)
+            # advance by number of valid pairs processed
+            _safe_update(task_id, advance=len(sources))
 
         _write_jsonl(output_path, rows)
         _finish_task(task_id, f"[green]Cached {output_path.name}")
@@ -954,8 +1015,11 @@ class CachedIdeaDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
+        if "idea_q" in sample and "idea_scale" in sample:
+            idea = _dequantize_int8(sample["idea_q"], sample["idea_scale"])
+            return {"idea": torch.tensor(idea, dtype=torch.float16)}
         return {
-            "idea": torch.tensor(sample["idea"], dtype=torch.float32)
+            "idea": torch.tensor(sample["idea"], dtype=torch.float16)
         }
 
 
@@ -972,8 +1036,13 @@ class CachedAdapterDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
+        if f"{self.idea_key}_q" in sample and f"{self.idea_key}_scale" in sample:
+            idea = _dequantize_int8(sample[f"{self.idea_key}_q"], sample[f"{self.idea_key}_scale"])
+            idea_tensor = torch.tensor(idea, dtype=torch.float16)
+        else:
+            idea_tensor = torch.tensor(sample[self.idea_key], dtype=torch.float16)
         return {
-            "idea": torch.tensor(sample[self.idea_key], dtype=torch.float32),
+            "idea": idea_tensor,
             "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
             "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
         }
@@ -989,9 +1058,19 @@ class CachedSciTLDRPairs(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
+        if "source_idea_q" in sample and "source_idea_scale" in sample:
+            source_idea = _dequantize_int8(sample["source_idea_q"], sample["source_idea_scale"])
+            source_idea_tensor = torch.tensor(source_idea, dtype=torch.float16)
+        else:
+            source_idea_tensor = torch.tensor(sample["source_idea"], dtype=torch.float16)
+        if "target_idea_q" in sample and "target_idea_scale" in sample:
+            target_idea = _dequantize_int8(sample["target_idea_q"], sample["target_idea_scale"])
+            target_idea_tensor = torch.tensor(target_idea, dtype=torch.float16)
+        else:
+            target_idea_tensor = torch.tensor(sample["target_idea"], dtype=torch.float16)
         return {
-            "source_idea": torch.tensor(sample["source_idea"], dtype=torch.float32),
-            "target_idea": torch.tensor(sample["target_idea"], dtype=torch.float32),
+            "source_idea": source_idea_tensor,
+            "target_idea": target_idea_tensor,
             "summary_ids": torch.tensor(sample["target_target_ids"], dtype=torch.long),
             "summary_attention_mask": torch.tensor(sample["target_target_attention_mask"], dtype=torch.long)
         }
@@ -999,10 +1078,12 @@ class CachedSciTLDRPairs(Dataset):
 
 def collate_cached_ideas(batch: list, model = None, config = None) -> dict:
     ideas = torch.stack([item["idea"] for item in batch])
+    ideas = ideas.to(dtype=torch.float16)
     
     # Append STOP_LATENT if model is provided and use_stop_latent is enabled
     if model is not None and getattr(config, "use_stop_latent", True):
         stop_latent = model.get_stop_latent(device=ideas.device)
+        stop_latent = stop_latent.to(dtype=torch.float16)
         ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
     
     return {"idea": ideas}
@@ -1010,6 +1091,7 @@ def collate_cached_ideas(batch: list, model = None, config = None) -> dict:
 
 def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
     ideas = torch.stack([item["idea"] for item in batch])
+    ideas = ideas.to(dtype=torch.float16)
     target_ids = torch.stack([item["target_ids"] for item in batch])
     target_attention_mask = torch.stack([item["target_attention_mask"] for item in batch])
     
@@ -1017,6 +1099,7 @@ def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
     if model is not None and getattr(config, "use_stop_latent", True):
         batch_size = ideas.size(0)
         stop_latent = model.get_stop_latent(device=ideas.device)
+        stop_latent = stop_latent.to(dtype=torch.float16)
         eos_token_id = model.gpt2.config.eos_token_id
         
         # Append STOP_LATENT to ideas (1 sample for STOP_LATENT)
@@ -1039,13 +1122,16 @@ def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
 
 def collate_cached_pairs(batch: list, model = None, config = None) -> dict:
     source_ideas = torch.stack([item["source_idea"] for item in batch])
+    source_ideas = source_ideas.to(dtype=torch.float16)
     target_ideas = torch.stack([item["target_idea"] for item in batch])
+    target_ideas = target_ideas.to(dtype=torch.float16)
     summary_ids = torch.stack([item["summary_ids"] for item in batch])
     summary_attention_mask = torch.stack([item["summary_attention_mask"] for item in batch])
     
     # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
     if model is not None and getattr(config, "use_stop_latent", True):
         stop_latent = model.get_stop_latent(device=source_ideas.device)
+        stop_latent = stop_latent.to(dtype=torch.float16)
         eos_token_id = model.gpt2.config.eos_token_id
         
         # Append STOP_LATENT to both source and target ideas (1 sample)

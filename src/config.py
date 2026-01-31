@@ -100,8 +100,8 @@ class Config:
     adapter_pretrain_use_middle: bool = False
 
     # Stage-specific epochs
-    pretrain_middle_epochs: int = 3
-    pretrain_adapter_epochs: int = 3
+    pretrain_middle_epochs: int = 4
+    pretrain_adapter_epochs: int = 8
     finetune_middle_epochs: int = 2
     finetune_adapter_epochs: int = 2
 
