@@ -85,7 +85,7 @@ class Config:
     preprocess_cache_dir: str = "cache/preprocessed"
     preprocess_format: str = "jsonl"
     skip_preprocessing_if_cached: bool = True
-    preprocess_batch_size: int = 256
+    preprocess_batch_size: int = 1024
     preprocess_wikitext: bool = True
     preprocess_arxiv: bool = True
     preprocess_english_pretrain: bool = True
