@@ -20,10 +20,10 @@ class Config:
     
     # Training hyperparameters
     learning_rate: float = 2e-5
-    batch_size: int = 32
+    batch_size: int = 22
     gradient_accumulation_steps: int = 2
-    max_seq_len: int = 512
-    max_target_len: int = 256
+    max_seq_len: int = 1024
+    max_target_len: int = 512
     num_workers: int = 4  # Number of workers for data loading
     
     # Model names
@@ -85,7 +85,7 @@ class Config:
     preprocess_cache_dir: str = "cache/preprocessed"
     preprocess_format: str = "jsonl"
     skip_preprocessing_if_cached: bool = True
-    preprocess_batch_size: int = 1024
+    preprocess_batch_size: int = 512
     preprocess_wikitext: bool = True
     preprocess_arxiv: bool = True
     preprocess_english_pretrain: bool = True
