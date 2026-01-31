@@ -15,7 +15,7 @@ class Config:
     modernbert_hidden_dim: int = 768
     gpt2_hidden_dim: int = 640  # Gemma-3-270m hidden dimension
     middle_hidden_dim: int = 512
-    middle_layers: int = 3
+    middle_layers: int = 4
     num_encoder_unfrozen_layers: int = 2  # Number of top ModernBERT layers to unfreeze in Phase 2
     
     # Training hyperparameters
@@ -68,7 +68,7 @@ class Config:
     train_split: str = "train"
     validation_split: str = "validation"
     test_split: str = "test"
-    max_train_samples: int = 10000  # Use subset for faster prototyping
+    max_train_samples: int = None  # Use subset for faster prototyping
 
     # Scientific pretraining datasets
     wikitext_dataset: str = "Hieuman/wikitext-103-filtered"
@@ -77,8 +77,8 @@ class Config:
     wikitext_split: str = "train"
     arxiv_split: str = "train"
     english_pretrain_split: str = "train"
-    wikitext_max_samples: int = 500000
-    arxiv_max_samples: int = 500000
+    wikitext_max_samples: int = 750000
+    arxiv_max_samples: int = 750000
     english_pretrain_max_samples: int = None
 
     # Preprocessing / caching
@@ -100,8 +100,8 @@ class Config:
     adapter_pretrain_use_middle: bool = False
 
     # Stage-specific epochs
-    pretrain_middle_epochs: int = 4
-    pretrain_adapter_epochs: int = 8
+    pretrain_middle_epochs: int = 6
+    pretrain_adapter_epochs: int = 10
     finetune_middle_epochs: int = 2
     finetune_adapter_epochs: int = 2
 
