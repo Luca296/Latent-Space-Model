@@ -6,9 +6,11 @@ Supports both Rich TUI and simple Tqdm output.
 """
 
 import os
+import argparse
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
@@ -34,14 +36,55 @@ from rich.text import Text
 from rich import box
 
 from src.models import LatentSpaceModel
-from src.data import create_dataloaders, create_identity_dataloaders, create_phase1_dataloaders
 from src.config import Config
+from src.data import (
+    create_dataloaders,
+    create_identity_dataloaders,
+    create_phase1_dataloaders,
+    preprocess_and_cache_datasets,
+    create_pretrain_middle_dataloaders,
+    create_pretrain_adapter_dataloader,
+    create_finetune_middle_dataloader,
+    create_finetune_adapter_dataloader,
+    create_finetune_adapter_dataloaders
+)
 
 
 # --- Common Functions ---
 
 # Decoder pad token ID (use PyTorch's default ignore index)
 DECODER_PAD_TOKEN_ID = -100
+
+
+def append_stop_latent_to_latent_batch(
+    z_in: torch.Tensor,
+    z_target: torch.Tensor,
+    model: LatentSpaceModel
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stop_latent = model.get_stop_latent(batch_size=z_in.size(0), device=z_in.device)
+    z_in_aug = torch.cat([z_in, stop_latent], dim=0)
+    z_target_aug = torch.cat([z_target, stop_latent], dim=0)
+    return z_in_aug, z_target_aug
+
+
+def append_stop_latent_to_decoder_batch(
+    z_in: torch.Tensor,
+    target_ids: torch.Tensor,
+    target_attention_mask: torch.Tensor,
+    model: LatentSpaceModel
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seq_len = target_ids.size()
+    stop_latent = model.get_stop_latent(batch_size=batch_size, device=z_in.device)
+    eos_token_id = model.gpt2.config.eos_token_id
+
+    eos_targets = torch.full_like(target_ids, fill_value=eos_token_id)
+    eos_attention = torch.zeros_like(target_attention_mask)
+    eos_attention[:, 0] = 1
+
+    z_in_aug = torch.cat([z_in, stop_latent], dim=0)
+    target_ids_aug = torch.cat([target_ids, eos_targets], dim=0)
+    target_attention_aug = torch.cat([target_attention_mask, eos_attention], dim=0)
+    return z_in_aug, target_ids_aug, target_attention_aug
 
 
 def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor, 
@@ -66,6 +109,22 @@ def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor,
     loss = loss_per_token.sum() / torch.clamp(target_mask_flat.sum(), min=1e-9)
     
     return loss
+
+
+def compute_contrastive_loss(z_pred: torch.Tensor, z_target: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    z_pred = F.normalize(z_pred, dim=-1)
+    z_target = F.normalize(z_target, dim=-1)
+    logits = torch.matmul(z_pred, z_target.t()) / temperature
+    labels = torch.arange(z_pred.size(0), device=z_pred.device)
+    loss_forward = F.cross_entropy(logits, labels)
+    loss_backward = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_forward + loss_backward)
+
+
+def compute_latent_loss(z_pred: torch.Tensor, z_target: torch.Tensor, config: Config) -> torch.Tensor:
+    mse = F.mse_loss(z_pred, z_target)
+    contrastive = compute_contrastive_loss(z_pred, z_target)
+    return (config.latent_mse_weight * mse) + (config.contrastive_weight * contrastive)
 
 
 def save_checkpoint(
@@ -473,12 +532,317 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
     return best_model_saved
 
 
+# --- Two-Stage Scientific Pipeline ---
+
+def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epoch, target_key: str = "idea"):
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    progress_bar = tqdm(dataloader, desc=f"Middle Epoch {epoch+1}")
+
+    optimizer.zero_grad()
+    for step, batch in enumerate(progress_bar):
+        z_in = batch[target_key].to(device)
+        z_in, z_target = append_stop_latent_to_latent_batch(z_in, z_in, model)
+        with autocast(enabled=config.use_fp16):
+            z_out = model.middle_model(z_in)
+            loss = compute_latent_loss(z_out, z_target, config)
+            loss = loss / config.gradient_accumulation_steps
+
+        scaler.scale(loss).backward()
+        total_loss += loss.item() * config.gradient_accumulation_steps
+        num_batches += 1
+
+        if (step + 1) % config.gradient_accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            progress_bar.set_postfix({"loss": total_loss / num_batches})
+
+    if num_batches % config.gradient_accumulation_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return total_loss / max(1, num_batches)
+
+
+def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, config, epoch):
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    progress_bar = tqdm(dataloader, desc=f"Middle Fine-Tune {epoch+1}")
+
+    optimizer.zero_grad()
+    for step, batch in enumerate(progress_bar):
+        source_idea = batch["source_idea"].to(device)
+        target_idea = batch["target_idea"].to(device)
+        source_idea, target_idea = append_stop_latent_to_latent_batch(source_idea, target_idea, model)
+
+        with autocast(enabled=config.use_fp16):
+            z_out = model.middle_model(source_idea)
+            loss = compute_latent_loss(z_out, target_idea, config)
+            loss = loss / config.gradient_accumulation_steps
+
+        scaler.scale(loss).backward()
+        total_loss += loss.item() * config.gradient_accumulation_steps
+        num_batches += 1
+
+        if (step + 1) % config.gradient_accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            progress_bar.set_postfix({"loss": total_loss / num_batches})
+
+    if num_batches % config.gradient_accumulation_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return total_loss / max(1, num_batches)
+
+
+def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, epoch, use_middle: bool, is_summary: bool = False):
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    progress_bar = tqdm(dataloader, desc=f"Adapter Epoch {epoch+1}")
+
+    optimizer.zero_grad()
+    for step, batch in enumerate(progress_bar):
+        if is_summary:
+            z_in = batch["source_idea"].to(device)
+            target_ids = batch["summary_ids"].to(device)
+            target_attention = batch["summary_attention_mask"].to(device)
+        else:
+            z_in = batch["idea"].to(device)
+            target_ids = batch["target_ids"].to(device)
+            target_attention = batch["target_attention_mask"].to(device)
+
+        z_in, target_ids, target_attention = append_stop_latent_to_decoder_batch(
+            z_in,
+            target_ids,
+            target_attention,
+            model
+        )
+
+        with autocast(enabled=config.use_fp16):
+            logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
+            loss = compute_loss(logits, target_ids, target_attention)
+            loss = loss / config.gradient_accumulation_steps
+
+        scaler.scale(loss).backward()
+        total_loss += loss.item() * config.gradient_accumulation_steps
+        num_batches += 1
+
+        if (step + 1) % config.gradient_accumulation_steps == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            progress_bar.set_postfix({"loss": total_loss / num_batches})
+
+    if num_batches % config.gradient_accumulation_steps != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return total_loss / max(1, num_batches)
+
+
+def validate_adapter_epoch(model, dataloader, device, config, use_middle: bool) -> float:
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating (Summary)"):
+            z_in = batch["source_idea"].to(device)
+            target_ids = batch["summary_ids"].to(device)
+            target_attention = batch["summary_attention_mask"].to(device)
+            with autocast(enabled=config.use_fp16):
+                logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
+                loss = compute_loss(logits, target_ids, target_attention)
+            total_loss += loss.item()
+            num_batches += 1
+    return total_loss / max(1, num_batches)
+
+
 # --- Main Entry ---
 
 def train(config: Config):
     """Main training function dispatch."""
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    if getattr(config, "pipeline_mode", "legacy") == "two_stage_scientific":
+        cache_paths = {}
+        if getattr(config, "run_preprocessing", True):
+            print("\n" + "="*60)
+            print("PREPROCESSING & CACHING STAGE")
+            print("="*60)
+            print("Running preprocessing/cache step...")
+            print("Note: This runs once and caches results to disk.")
+            print("Set preprocess_wikitext/arxiv/english_pretrain=False to skip datasets.")
+            print("="*60 + "\n")
+            cache_paths = preprocess_and_cache_datasets(config)
+        else:
+            cache_dir = Path(config.preprocess_cache_dir)
+            cache_paths = {
+                "wikitext_train": cache_dir / "wikitext_train.jsonl",
+                "wikitext_validation": cache_dir / "wikitext_validation.jsonl",
+                "arxiv_train": cache_dir / "arxiv_train.jsonl",
+                "arxiv_validation": cache_dir / "arxiv_validation.jsonl",
+                "english_pretrain_train": cache_dir / "english_pretrain_train.jsonl",
+                "english_pretrain_validation": cache_dir / "english_pretrain_validation.jsonl",
+                "scitldr_train": cache_dir / "scitldr_train.jsonl",
+                "scitldr_validation": cache_dir / "scitldr_validation.jsonl",
+                "compression_mlp": cache_dir / "compression_mlp.pt"
+            }
+
+        print("Initializing model for two-stage pipeline...")
+        model = LatentSpaceModel(config).to(device)
+
+        if cache_paths.get("compression_mlp") and Path(cache_paths["compression_mlp"]).exists():
+            model.encoder.compression_mlp.load_state_dict(torch.load(cache_paths["compression_mlp"], map_location=device, weights_only=False))
+            print("Loaded cached compression MLP weights.")
+
+        if getattr(config, "freeze_encoder_compression_in_pipeline", True):
+            for param in model.encoder.compression_mlp.parameters():
+                param.requires_grad = False
+
+        scaler = GradScaler(enabled=config.use_fp16)
+
+        checkpoint_dir = Path(config.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        handoff_best_path = checkpoint_dir / config.handoff_best_model_filename
+        pretrain_best_path = checkpoint_dir / config.pretrain_best_model_filename
+        finetune_best_path = checkpoint_dir / config.finetune_best_model_filename
+
+        # Pretraining: Middle model
+        if getattr(config, "run_pretraining", True):
+            print("\nStage 1: Middle Model Pretraining")
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.middle_model.parameters():
+                param.requires_grad = True
+
+            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
+            original_num_workers = config.num_workers
+            config.num_workers = 0
+            train_loader = create_pretrain_middle_dataloaders(config, cache_paths, model=model)
+            config.num_workers = original_num_workers
+            
+            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            for epoch in range(config.pretrain_middle_epochs):
+                loss = train_middle_epoch(model, train_loader, optimizer, scaler, device, config, epoch)
+                print(f"Middle Pretrain Epoch {epoch+1}: loss={loss:.4f}")
+
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "pretrain_middle.pt", _use_new_zipfile_serialization=False)
+
+            print("\nStage 2: Adapter Pretraining")
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.prefix_adapter.parameters():
+                param.requires_grad = True
+            for param in model.prefix_layernorm.parameters():
+                param.requires_grad = True
+
+            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
+            config.num_workers = 0
+            adapter_loader = create_pretrain_adapter_dataloader(config, cache_paths, model=model)
+            config.num_workers = original_num_workers
+            
+            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            for epoch in range(config.pretrain_adapter_epochs):
+                loss = train_adapter_epoch(
+                    model,
+                    adapter_loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    config,
+                    epoch,
+                    use_middle=getattr(config, "adapter_pretrain_use_middle", False),
+                    is_summary=False
+                )
+                print(f"Adapter Pretrain Epoch {epoch+1}: loss={loss:.4f}")
+
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "pretrain_adapter.pt", _use_new_zipfile_serialization=False)
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, pretrain_best_path, _use_new_zipfile_serialization=False)
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, handoff_best_path, _use_new_zipfile_serialization=False)
+
+        # Load pretrain best model before fine-tuning if needed
+        if getattr(config, "run_finetuning", True) and (not getattr(config, "run_pretraining", True)):
+            if handoff_best_path.exists():
+                checkpoint = torch.load(handoff_best_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                print(f"Loaded pretrain best model from {handoff_best_path}.")
+            elif pretrain_best_path.exists():
+                checkpoint = torch.load(pretrain_best_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                print(f"Loaded pretrain best model from {pretrain_best_path}.")
+            else:
+                print("[WARNING] Pretrain best model not found. Fine-tuning from current weights.")
+
+        # Fine-tuning: Summarization
+        if getattr(config, "run_finetuning", True):
+            print("\nStage 3: Middle Model Summarization Fine-Tune")
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.middle_model.parameters():
+                param.requires_grad = True
+
+            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
+            original_num_workers = config.num_workers
+            config.num_workers = 0
+            finetune_middle_loader = create_finetune_middle_dataloader(config, cache_paths, model=model)
+            config.num_workers = original_num_workers
+            
+            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            for epoch in range(config.finetune_middle_epochs):
+                loss = train_middle_finetune_epoch(model, finetune_middle_loader, optimizer, scaler, device, config, epoch)
+                print(f"Middle Fine-tune Epoch {epoch+1}: loss={loss:.4f}")
+
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "finetune_middle.pt", _use_new_zipfile_serialization=False)
+
+            print("\nStage 4: Adapter + Decoder Summarization Fine-Tune")
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.prefix_adapter.parameters():
+                param.requires_grad = True
+            for param in model.prefix_layernorm.parameters():
+                param.requires_grad = True
+
+            # Temporarily use num_workers=0 to avoid CUDA worker issues with model access
+            config.num_workers = 0
+            finetune_adapter_loader, finetune_val_loader = create_finetune_adapter_dataloaders(config, cache_paths, model=model)
+            config.num_workers = original_num_workers
+            
+            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            best_val_loss = float("inf")
+            for epoch in range(config.finetune_adapter_epochs):
+                loss = train_adapter_epoch(
+                    model,
+                    finetune_adapter_loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    config,
+                    epoch,
+                    use_middle=True,
+                    is_summary=True
+                )
+                val_loss = validate_adapter_epoch(model, finetune_val_loader, device, config, use_middle=True)
+                print(f"Adapter Fine-tune Epoch {epoch+1}: loss={loss:.4f} | val_loss={val_loss:.4f}")
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save({"model_state_dict": model.state_dict(), "config": config}, finetune_best_path, _use_new_zipfile_serialization=False)
+                    torch.save({"model_state_dict": model.state_dict(), "config": config}, handoff_best_path, _use_new_zipfile_serialization=False)
+
+            torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "finetune_adapter.pt", _use_new_zipfile_serialization=False)
+
+        print("Two-stage pipeline complete.")
+        return
     
     # Check for diagnostic test modes
     test_mode = getattr(config, 'test_mode', None)
@@ -624,6 +988,19 @@ def train(config: Config):
     print(f"Trainable parameters: {trainable_params:,}")
     
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    # Debug: report trainable param counts for key components to ensure projection/prefix are trainable
+    try:
+        prefix_params = sum(p.numel() for p in model.prefix_adapter.parameters() if p.requires_grad)
+        compression_params = sum(p.numel() for p in model.encoder.compression_mlp.parameters() if p.requires_grad)
+        middle_params = sum(p.numel() for p in model.middle_model.parameters() if p.requires_grad)
+        print(f"  - Prefix adapter trainable params: {prefix_params:,}")
+        print(f"  - Encoder compression trainable params: {compression_params:,}")
+        print(f"  - Middle model trainable params: {middle_params:,}")
+        if prefix_params == 0:
+            print("[WARNING] prefix_adapter has 0 trainable parameters. Check freezing logic.")
+    except Exception:
+        pass
+
     optimizer = AdamW(trainable_params_list, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = GradScaler(enabled=config.use_fp16)
     
@@ -649,5 +1026,17 @@ def train(config: Config):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Latent-space model training")
+    parser.add_argument("--fine-tune", action="store_true", help="Run only fine-tuning using best_model.pt")
+    args = parser.parse_args()
+
     config = Config()
+    if getattr(config, "pipeline_mode", "legacy") == "two_stage_scientific":
+        if args.fine_tune:
+            config.run_pretraining = False
+            config.run_finetuning = True
+        else:
+            config.run_pretraining = True
+            config.run_finetuning = False
+
     train(config)

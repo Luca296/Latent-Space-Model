@@ -5,3 +5,4 @@ output2.txt
 config_saved.json
 .venv
 .claude
+/cache

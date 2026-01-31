@@ -216,6 +216,14 @@ class LatentSpaceInference:
         
         # Interpolate
         z_interp = (1 - alpha) * z1 + alpha * z2
+
+        # Stop early if interpolated latent matches STOP_LATENT
+        if getattr(self.config, "use_stop_latent", True):
+            cosine_threshold = getattr(self.config, "stop_latent_cosine_threshold", None)
+            l2_threshold = getattr(self.config, "stop_latent_l2_threshold", None)
+            stop_mask = self.model.is_stop_latent(z_interp, cosine_threshold=cosine_threshold, l2_threshold=l2_threshold)
+            if stop_mask.all():
+                return ""
         
         # Get prefix embeddings
         with torch.no_grad():
@@ -331,18 +339,35 @@ if __name__ == "__main__":
     # Check if checkpoint exists
     checkpoint_dir = Path(config.checkpoint_dir)
     if checkpoint_dir.exists():
-        # Try to load best model
-        best_model_path = checkpoint_dir / "best_model.pt"
-        if best_model_path.exists():
-            model_path = str(best_model_path)
+        # Gather all .pt files in the checkpoint dir and let user select
+        pt_files = sorted(list(checkpoint_dir.glob("*.pt")), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not pt_files:
+            print("No .pt checkpoints found in the checkpoint directory. Please train the model first.")
+            exit(1)
+
+        print("Available checkpoints:")
+        for i, p in enumerate(pt_files, start=1):
+            mtime = p.stat().st_mtime
+            print(f"  [{i}] {p.name}  —  {p}")
+
+        # Prompt user to select a model by number
+        try:
+            sel = input(f"Select model to load [1-{len(pt_files)}] (default 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSelection cancelled. Exiting.")
+            exit(1)
+
+        if sel == "":
+            sel_idx = 1
         else:
-            # Load latest checkpoint
-            checkpoints = list(checkpoint_dir.glob("checkpoint_step_*.pt"))
-            if checkpoints:
-                model_path = str(checkpoints[-1])
-            else:
-                print("No checkpoint found. Please train the model first.")
-                exit(1)
+            try:
+                sel_idx = int(sel)
+            except ValueError:
+                print("Invalid selection. Using default (1).")
+                sel_idx = 1
+
+        sel_idx = max(1, min(len(pt_files), sel_idx))
+        model_path = str(pt_files[sel_idx - 1])
     else:
         print("No checkpoint directory found. Please train the model first.")
         exit(1)

@@ -11,7 +11,7 @@ class Config:
     
     # Model dimensions
     latent_dim: int = 256
-    prefix_len: int = 10  # Reduced from 50 for more stable training
+    prefix_len: int = 50  # Restored to larger default to provide longer prefix context
     modernbert_hidden_dim: int = 768
     gpt2_hidden_dim: int = 640  # Gemma-3-270m hidden dimension
     middle_hidden_dim: int = 512
@@ -45,13 +45,23 @@ class Config:
     
     # Inference settings
     temperature: float = 0.7
-    max_generation_length: int = 128
+    max_generation_length: int = 256
     do_sample: bool = True
     top_p: float = 0.9
     top_k: int = 50
 
     # UI settings
     use_tui: bool = True
+
+    # Latent handling
+    normalize_latent: bool = True  # If True, L2-normalize latent vectors before decoding
+
+    # Latent STOP vector handling
+    use_stop_latent: bool = True
+    stop_latent_init: str = "random_normalized"  # "zero" or "random_normalized"
+    stop_latent_seed: int = 1337
+    stop_latent_cosine_threshold: float = 0.99
+    stop_latent_l2_threshold: float = None
     
     # Dataset
     dataset_name: str = "knkarthick/samsum"
@@ -59,6 +69,50 @@ class Config:
     validation_split: str = "validation"
     test_split: str = "test"
     max_train_samples: int = 10000  # Use subset for faster prototyping
+
+    # Scientific pretraining datasets
+    wikitext_dataset: str = "Hieuman/wikitext-103-filtered"
+    arxiv_dataset: str = "macrocosm/arxiv_abstracts"
+    english_pretrain_dataset: str = "shuyuej/English-Pretraining-Dataset"
+    wikitext_split: str = "train"
+    arxiv_split: str = "train"
+    english_pretrain_split: str = "train"
+    wikitext_max_samples: int = 150000
+    arxiv_max_samples: int = 100000
+    english_pretrain_max_samples: int = None
+
+    # Preprocessing / caching
+    preprocess_cache_dir: str = "cache/preprocessed"
+    preprocess_format: str = "jsonl"
+    skip_preprocessing_if_cached: bool = True
+    preprocess_batch_size: int = 16
+    preprocess_wikitext: bool = True
+    preprocess_arxiv: bool = True
+    preprocess_english_pretrain: bool = True
+    preprocess_validation_fraction: float = 0.05
+
+    # Pipeline control
+    pipeline_mode: str = "two_stage_scientific"  # "two_stage_scientific" or "legacy"
+    run_preprocessing: bool = True
+    run_pretraining: bool = True
+    run_finetuning: bool = True
+    freeze_encoder_compression_in_pipeline: bool = True
+    adapter_pretrain_use_middle: bool = False
+
+    # Stage-specific epochs
+    pretrain_middle_epochs: int = 3
+    pretrain_adapter_epochs: int = 3
+    finetune_middle_epochs: int = 2
+    finetune_adapter_epochs: int = 2
+
+    # Combined objective weights (middle model)
+    latent_mse_weight: float = 1.0
+    contrastive_weight: float = 0.1
+
+    # Stage-specific checkpoints
+    pretrain_best_model_filename: str = "best_model_pretrain.pt"
+    finetune_best_model_filename: str = "best_model_finetune.pt"
+    handoff_best_model_filename: str = "best_model.pt"
     
     # Diagnostic test modes
     # "normal" = Standard training (Dialog -> Summary, all trainable)

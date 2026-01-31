@@ -10,7 +10,20 @@ Components:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM
+
+
+def _init_stop_latent(latent_dim: int, init: str = "random_normalized", seed: int = 1337) -> torch.Tensor:
+    if init == "zero":
+        return torch.zeros(latent_dim)
+    if init == "random_normalized":
+        generator = torch.Generator()
+        if seed is not None:
+            generator.manual_seed(seed)
+        vec = torch.randn(latent_dim, generator=generator)
+        return vec / vec.norm(p=2).clamp(min=1e-9)
+    raise ValueError(f"Unsupported stop_latent_init: {init}")
 
 
 class LatentEncoder(nn.Module):
@@ -228,6 +241,14 @@ class LatentSpaceModel(nn.Module):
         
         # Load GPT-2 for decoding
         self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
+
+        # Fixed STOP latent vector
+        stop_latent = _init_stop_latent(
+            latent_dim=config.latent_dim,
+            init=getattr(config, "stop_latent_init", "random_normalized"),
+            seed=getattr(config, "stop_latent_seed", 1337)
+        )
+        self.register_buffer("STOP_LATENT", stop_latent)
         
         # Freeze GPT-2 backbone
         for param in self.gpt2.parameters():
@@ -241,6 +262,36 @@ class LatentSpaceModel(nn.Module):
             self.gpt2_embeddings = self.gpt2.model.embed_tokens  # Gemma style
         else:
             raise RuntimeError("Could not find embedding layer in decoder model. Check model architecture.")
+
+    def get_stop_latent(self, batch_size: int = None, device: torch.device = None) -> torch.Tensor:
+        stop_latent = self.STOP_LATENT
+        if device is not None:
+            stop_latent = stop_latent.to(device)
+        if batch_size is not None:
+            return stop_latent.unsqueeze(0).expand(batch_size, -1)
+        return stop_latent
+
+    def is_stop_latent(
+        self,
+        z_out: torch.Tensor,
+        cosine_threshold: float = None,
+        l2_threshold: float = None
+    ) -> torch.Tensor:
+        if z_out.dim() == 1:
+            z_out = z_out.unsqueeze(0)
+        stop_latent = self.get_stop_latent(batch_size=z_out.size(0), device=z_out.device)
+
+        use_cosine = cosine_threshold is not None
+        use_l2 = l2_threshold is not None
+
+        stop_mask = torch.zeros(z_out.size(0), dtype=torch.bool, device=z_out.device)
+        if use_cosine:
+            cosine_sim = F.cosine_similarity(z_out, stop_latent, dim=-1)
+            stop_mask = stop_mask | (cosine_sim >= cosine_threshold)
+        if use_l2:
+            l2_dist = torch.norm(z_out - stop_latent, dim=-1)
+            stop_mask = stop_mask | (l2_dist <= l2_threshold)
+        return stop_mask
     
     def forward(
         self,
@@ -263,12 +314,42 @@ class LatentSpaceModel(nn.Module):
         """
         # Encode input to latent space
         z_in = self.encoder(input_ids, attention_mask)  # [B, latent_dim]
-        
+
         # Transform latent with middle model (or bypass for Phases 1 & 2)
         if self.bypass_middle:
             z_out = z_in  # Skip middle model
         else:
             z_out = self.middle_model(z_in)  # [B, latent_dim]
+
+        return self._decode_from_latent(z_out, target_ids, target_attention_mask)
+
+    def forward_from_latent(
+        self,
+        z_in: torch.Tensor,
+        target_ids: torch.Tensor,
+        target_attention_mask: torch.Tensor,
+        use_middle: bool = True
+    ) -> torch.Tensor:
+        """Forward pass when latent vectors are already computed."""
+        if use_middle and not self.bypass_middle:
+            z_out = self.middle_model(z_in)
+        else:
+            z_out = z_in
+
+        return self._decode_from_latent(z_out, target_ids, target_attention_mask)
+
+    def _decode_from_latent(
+        self,
+        z_out: torch.Tensor,
+        target_ids: torch.Tensor,
+        target_attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode from latent vector into logits."""
+
+        # Optional L2-normalization of latent vectors before decoding/expansion
+        if getattr(self.config, 'normalize_latent', False):
+            denom = z_out.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)
+            z_out = z_out / denom
         
         # Expand to prefix embeddings
         prefix_embeddings = self.prefix_adapter(z_out)  # [B, prefix_len, gpt2_hidden_dim]
@@ -290,7 +371,7 @@ class LatentSpaceModel(nn.Module):
         input_embeds = torch.cat([prefix_embeddings, target_embeddings], dim=1)  # [B, prefix_len + T-1, gpt2_hidden_dim]
         
         # Prepare attention mask for GPT-2
-        prefix_attention = torch.ones(batch_size, self.config.prefix_len, device=input_ids.device)
+        prefix_attention = torch.ones(batch_size, self.config.prefix_len, device=target_ids.device)
         target_attention = target_attention_mask[:, :-1]
         combined_attention = torch.cat([prefix_attention, target_attention], dim=1)
         
@@ -322,6 +403,11 @@ class LatentSpaceModel(nn.Module):
     
     def get_prefix_embeddings(self, z_out: torch.Tensor) -> torch.Tensor:
         """Get prefix embeddings from latent vector (for inference)."""
+        # Normalize latent vectors before expansion if configured
+        if getattr(self.config, 'normalize_latent', False):
+            denom = z_out.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)
+            z_out = z_out / denom
+
         prefix_embeddings = self.prefix_adapter(z_out)
         prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
         # Cast to decoder model dtype (handles BFloat16, Float16, etc.)
@@ -360,6 +446,14 @@ class LatentSpaceModel(nn.Module):
         
         # Encode input to latent space
         z_out = self.encode_to_latent(input_ids, attention_mask)
+
+        # Stop early if latent matches STOP_LATENT
+        if getattr(self.config, "use_stop_latent", True):
+            cosine_threshold = getattr(self.config, "stop_latent_cosine_threshold", None)
+            l2_threshold = getattr(self.config, "stop_latent_l2_threshold", None)
+            stop_mask = self.is_stop_latent(z_out, cosine_threshold=cosine_threshold, l2_threshold=l2_threshold)
+        else:
+            stop_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
         # Get prefix embeddings
         prefix_embeddings = self.get_prefix_embeddings(z_out)  # [B, prefix_len, gpt2_hidden_dim]
@@ -371,7 +465,10 @@ class LatentSpaceModel(nn.Module):
         # Initialize generation with prefix
         current_embeds = prefix_embeddings
         generated_ids_list = []  # List to collect generated tokens
-        has_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)  # Track which sequences have hit EOS
+        has_eos = stop_mask.clone()  # Track which sequences have hit EOS or STOP_LATENT
+
+        if has_eos.all():
+            return torch.full((batch_size, 1), eos_token_id, dtype=torch.long, device=device)
         
         for i in range(max_length):
             # Run GPT-2 on current embeddings
@@ -409,13 +506,18 @@ class LatentSpaceModel(nn.Module):
             else:
                 next_token = torch.argmax(logits, dim=-1)
             
+            # Enforce EOS for sequences that already stopped
+            if has_eos.any():
+                next_token = torch.where(has_eos, torch.full_like(next_token, eos_token_id), next_token)
+
             # Store generated token
             generated_ids_list.append(next_token)
-            
-            # Check for EOS and stop early if all sequences have generated EOS
+
+            # Check for EOS and stop early if any sequence has generated EOS
             is_eos = next_token == eos_token_id
             has_eos = has_eos | is_eos
-            if has_eos.all():
+            # Stop generation as soon as any EOS is produced
+            if is_eos.any():
                 break
             
             # Get embedding for next token and append

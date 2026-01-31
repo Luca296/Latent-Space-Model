@@ -4,10 +4,28 @@ Data loading and preprocessing for the latent-space reasoning model.
 Handles SAMSum dataset loading, tokenization, and batching.
 """
 
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+from pathlib import Path
+from typing import Iterable, Optional
+
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from transformers import AutoTokenizer
 from datasets import load_dataset
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn
+)
+
+from src.models import LatentEncoder
 
 
 class SAMSumDataset(Dataset):
@@ -469,4 +487,746 @@ def create_phase1_dataloaders(
         pin_memory=True if torch.cuda.is_available() else False
     )
 
+    return train_loader, val_loader
+
+
+# --- Cached Scientific Pretraining / Fine-tuning ---
+
+def _mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    expanded_mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+    sum_embeddings = torch.sum(hidden_states * expanded_mask, dim=1)
+    sum_mask = torch.clamp(expanded_mask.sum(dim=1), min=1e-9)
+    return sum_embeddings / sum_mask
+
+
+def _extract_field(item: dict, candidates: Iterable[str]) -> Optional[str]:
+    for key in candidates:
+        value = item.get(key, None)
+        if value:
+            return value
+    return None
+
+
+def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def preprocess_and_cache_datasets(config) -> dict:
+    """
+    Preprocess datasets into jsonl cache: tokenized text, embeddings, and idea vectors.
+    Returns paths for cached files.
+    """
+    cache_dir = Path(config.preprocess_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_paths = {
+        "wikitext_train": cache_dir / "wikitext_train.jsonl",
+        "wikitext_validation": cache_dir / "wikitext_validation.jsonl",
+        "arxiv_train": cache_dir / "arxiv_train.jsonl",
+        "arxiv_validation": cache_dir / "arxiv_validation.jsonl",
+        "english_pretrain_train": cache_dir / "english_pretrain_train.jsonl",
+        "english_pretrain_validation": cache_dir / "english_pretrain_validation.jsonl",
+        "scitldr_train": cache_dir / "scitldr_train.jsonl",
+        "scitldr_validation": cache_dir / "scitldr_validation.jsonl",
+        "compression_mlp": cache_dir / "compression_mlp.pt"
+    }
+
+    if config.skip_preprocessing_if_cached:
+        required = []
+        if getattr(config, "preprocess_wikitext", True):
+            required += [cache_paths["wikitext_train"], cache_paths["wikitext_validation"]]
+        if getattr(config, "preprocess_arxiv", True):
+            required += [cache_paths["arxiv_train"], cache_paths["arxiv_validation"]]
+        if getattr(config, "preprocess_english_pretrain", True):
+            required += [cache_paths["english_pretrain_train"], cache_paths["english_pretrain_validation"]]
+        if getattr(config, "preprocess_scitldr", False) and hasattr(config, "scitldr_dataset"):
+            required += [cache_paths["scitldr_train"], cache_paths["scitldr_validation"]]
+        required += [cache_paths["compression_mlp"]]
+        if all(p.exists() for p in required):
+            return cache_paths
+
+    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+
+    # Tokenizers
+    modernbert_tokenizer = AutoTokenizer.from_pretrained(config.modernbert_model)
+    decoder_tokenizer = AutoTokenizer.from_pretrained(config.gpt2_model)
+    if decoder_tokenizer.pad_token is None:
+        decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+
+    # Encoder for embeddings + idea vectors
+    encoder = LatentEncoder(
+        model_name=config.modernbert_model,
+        hidden_dim=config.modernbert_hidden_dim,
+        latent_dim=config.latent_dim,
+        num_unfrozen_layers=0
+    ).to(device)
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad = False
+
+    # Save compression MLP weights for training alignment
+    torch.save(encoder.compression_mlp.state_dict(), cache_paths["compression_mlp"], _use_new_zipfile_serialization=False)
+
+    def _split_dataset(dataset, val_fraction: float):
+        if val_fraction <= 0 or len(dataset) < 2:
+            return dataset, None
+        split = dataset.train_test_split(test_size=val_fraction, seed=42, shuffle=True)
+        return split["train"], split["test"]
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn()
+    )
+    progress_lock = threading.Lock()
+    gpu_lock = threading.Lock()
+
+    def _safe_update(task_id, **kwargs):
+        with progress_lock:
+            progress.update(task_id, **kwargs)
+
+    def _finish_task(task_id, description: str):
+        task = progress.get_task(task_id)
+        _safe_update(task_id, description=description, completed=task.total)
+
+    def _prepare_task(output_path: Path, label: str):
+        with progress_lock:
+            return progress.add_task(f"{label}: {output_path.name}", total=1)
+
+    def process_single_text_dataset(dataset, output_path: Path, label: str, task_id: int):
+        if output_path.exists():
+            _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+            return
+
+        rows = []
+        batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
+        total_batches = (len(dataset) + batch_size - 1) // batch_size
+        _safe_update(task_id, total=total_batches, completed=0, description=f"{label}: {output_path.name}")
+
+        for start in range(0, len(dataset), batch_size):
+            batch = dataset[start : start + batch_size]
+            texts = []
+            for i in range(len(next(iter(batch.values())))):
+                text = None
+                for key in ["text", "query"]:
+                    if key in batch and batch[key][i]:
+                        text = batch[key][i]
+                        break
+                if text:
+                    texts.append(text)
+            if not texts:
+                _safe_update(task_id, advance=1)
+                continue
+
+            input_enc = modernbert_tokenizer(
+                texts,
+                max_length=config.max_seq_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            target_enc = decoder_tokenizer(
+                texts,
+                max_length=config.max_target_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+
+            input_ids = input_enc["input_ids"].to(device)
+            attention_mask = input_enc["attention_mask"].to(device)
+
+            with gpu_lock, torch.no_grad():
+                outputs = encoder.modernbert(input_ids=input_ids, attention_mask=attention_mask)
+                hidden_states = outputs.last_hidden_state
+                pooled = _mean_pooling(hidden_states, attention_mask)
+                ideas = encoder.compression_mlp(pooled)
+
+            for i in range(len(texts)):
+                rows.append({
+                    "text": texts[i],
+                    "input_ids": input_enc["input_ids"][i].tolist(),
+                    "attention_mask": input_enc["attention_mask"][i].tolist(),
+                    "target_ids": target_enc["input_ids"][i].tolist(),
+                    "target_attention_mask": target_enc["attention_mask"][i].tolist(),
+                    "embedding": pooled[i].cpu().tolist(),
+                    "idea": ideas[i].cpu().tolist()
+                })
+            _safe_update(task_id, advance=1)
+
+        _write_jsonl(output_path, rows)
+        _finish_task(task_id, f"[green]Cached {output_path.name}")
+
+    def process_scitldr(dataset, output_path: Path, label: str, task_id: int):
+        if output_path.exists():
+            _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+            return
+
+        rows = []
+        batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
+        total_batches = (len(dataset) + batch_size - 1) // batch_size
+        _safe_update(task_id, total=total_batches, completed=0, description=f"{label}: {output_path.name}")
+
+        for start in range(0, len(dataset), batch_size):
+            batch = dataset[start : start + batch_size]
+            sources, targets = [], []
+            if "source" not in batch or "target" not in batch:
+                _safe_update(task_id, advance=1)
+                continue
+            for i in range(len(batch["source"])):
+                source = batch["source"][i]
+                target = batch["target"][i]
+                if source and target:
+                    sources.append(source)
+                    targets.append(target)
+
+            if not sources:
+                _safe_update(task_id, advance=1)
+                continue
+
+            source_enc = modernbert_tokenizer(
+                sources,
+                max_length=config.max_seq_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            target_enc = modernbert_tokenizer(
+                targets,
+                max_length=config.max_seq_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+
+            source_target_enc = decoder_tokenizer(
+                sources,
+                max_length=config.max_target_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            target_target_enc = decoder_tokenizer(
+                targets,
+                max_length=config.max_target_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+
+            source_input_ids = source_enc["input_ids"].to(device)
+            source_attention = source_enc["attention_mask"].to(device)
+            target_input_ids = target_enc["input_ids"].to(device)
+            target_attention = target_enc["attention_mask"].to(device)
+
+            with gpu_lock, torch.no_grad():
+                source_outputs = encoder.modernbert(input_ids=source_input_ids, attention_mask=source_attention)
+                target_outputs = encoder.modernbert(input_ids=target_input_ids, attention_mask=target_attention)
+                source_pooled = _mean_pooling(source_outputs.last_hidden_state, source_attention)
+                target_pooled = _mean_pooling(target_outputs.last_hidden_state, target_attention)
+                source_ideas = encoder.compression_mlp(source_pooled)
+                target_ideas = encoder.compression_mlp(target_pooled)
+
+            for i in range(len(sources)):
+                rows.append({
+                    "source": sources[i],
+                    "target": targets[i],
+                    "source_input_ids": source_enc["input_ids"][i].tolist(),
+                    "source_attention_mask": source_enc["attention_mask"][i].tolist(),
+                    "source_target_ids": source_target_enc["input_ids"][i].tolist(),
+                    "source_target_attention_mask": source_target_enc["attention_mask"][i].tolist(),
+                    "target_input_ids": target_enc["input_ids"][i].tolist(),
+                    "target_attention_mask": target_enc["attention_mask"][i].tolist(),
+                    "target_target_ids": target_target_enc["input_ids"][i].tolist(),
+                    "target_target_attention_mask": target_target_enc["attention_mask"][i].tolist(),
+                    "source_embedding": source_pooled[i].cpu().tolist(),
+                    "target_embedding": target_pooled[i].cpu().tolist(),
+                    "source_idea": source_ideas[i].cpu().tolist(),
+                    "target_idea": target_ideas[i].cpu().tolist()
+                })
+            _safe_update(task_id, advance=1)
+
+        _write_jsonl(output_path, rows)
+        _finish_task(task_id, f"[green]Cached {output_path.name}")
+
+    def load_train_only(dataset_name: str, split: str, max_samples: Optional[int]) -> Optional[object]:
+        try:
+            print(f"  Loading {dataset_name} ({split})...")
+            dataset = load_dataset(dataset_name, split=split)
+        except Exception as e:
+            print(f"  ERROR loading {dataset_name}: {e}")
+            print(f"  Skipping {dataset_name}")
+            return None
+
+        if max_samples is not None:
+            dataset = dataset.select(range(min(max_samples, len(dataset))))
+        print(f"  Loaded {len(dataset)} samples")
+        return dataset
+
+    val_fraction = float(getattr(config, "preprocess_validation_fraction", 0.05))
+
+    preprocess_scitldr = getattr(config, "preprocess_scitldr", False) and hasattr(config, "scitldr_dataset")
+
+    jobs = []
+    task_ids = {}
+
+    if getattr(config, "preprocess_wikitext", True):
+        task_ids["wikitext_train"] = _prepare_task(cache_paths["wikitext_train"], "WikiText Train")
+        task_ids["wikitext_validation"] = _prepare_task(cache_paths["wikitext_validation"], "WikiText Validation")
+
+        def _job_wikitext():
+            dataset = load_train_only(config.wikitext_dataset, config.wikitext_split, config.wikitext_max_samples)
+            if dataset is None:
+                _safe_update(task_ids["wikitext_train"], total=1, completed=1, description="[red]WikiText load failed")
+                _safe_update(task_ids["wikitext_validation"], total=1, completed=1, description="[red]WikiText load failed")
+                return
+            train_ds, val_ds = _split_dataset(dataset, val_fraction)
+            process_single_text_dataset(train_ds, cache_paths["wikitext_train"], "WikiText Train", task_ids["wikitext_train"])
+            if val_ds is not None:
+                process_single_text_dataset(val_ds, cache_paths["wikitext_validation"], "WikiText Validation", task_ids["wikitext_validation"])
+            else:
+                _safe_update(task_ids["wikitext_validation"], total=1, completed=1, description="[yellow]No validation split")
+
+        jobs.append(_job_wikitext)
+
+    if getattr(config, "preprocess_arxiv", True):
+        task_ids["arxiv_train"] = _prepare_task(cache_paths["arxiv_train"], "arXiv Train")
+        task_ids["arxiv_validation"] = _prepare_task(cache_paths["arxiv_validation"], "arXiv Validation")
+
+        def _job_arxiv():
+            dataset = load_train_only(config.arxiv_dataset, config.arxiv_split, config.arxiv_max_samples)
+            if dataset is None:
+                _safe_update(task_ids["arxiv_train"], total=1, completed=1, description="[red]arXiv load failed")
+                _safe_update(task_ids["arxiv_validation"], total=1, completed=1, description="[red]arXiv load failed")
+                return
+            train_ds, val_ds = _split_dataset(dataset, val_fraction)
+            process_single_text_dataset(train_ds, cache_paths["arxiv_train"], "arXiv Train", task_ids["arxiv_train"])
+            if val_ds is not None:
+                process_single_text_dataset(val_ds, cache_paths["arxiv_validation"], "arXiv Validation", task_ids["arxiv_validation"])
+            else:
+                _safe_update(task_ids["arxiv_validation"], total=1, completed=1, description="[yellow]No validation split")
+
+        jobs.append(_job_arxiv)
+
+    if getattr(config, "preprocess_english_pretrain", True):
+        task_ids["english_pretrain_train"] = _prepare_task(cache_paths["english_pretrain_train"], "English Pretrain Train")
+        task_ids["english_pretrain_validation"] = _prepare_task(cache_paths["english_pretrain_validation"], "English Pretrain Validation")
+
+        def _job_english_pretrain():
+            dataset = load_train_only(
+                config.english_pretrain_dataset,
+                config.english_pretrain_split,
+                config.english_pretrain_max_samples
+            )
+            if dataset is None:
+                _safe_update(task_ids["english_pretrain_train"], total=1, completed=1, description="[red]English pretrain load failed")
+                _safe_update(task_ids["english_pretrain_validation"], total=1, completed=1, description="[red]English pretrain load failed")
+                return
+            train_ds, val_ds = _split_dataset(dataset, val_fraction)
+            process_single_text_dataset(
+                train_ds,
+                cache_paths["english_pretrain_train"],
+                "English Pretrain Train",
+                task_ids["english_pretrain_train"]
+            )
+            if val_ds is not None:
+                process_single_text_dataset(
+                    val_ds,
+                    cache_paths["english_pretrain_validation"],
+                    "English Pretrain Validation",
+                    task_ids["english_pretrain_validation"]
+                )
+            else:
+                _safe_update(task_ids["english_pretrain_validation"], total=1, completed=1, description="[yellow]No validation split")
+
+        jobs.append(_job_english_pretrain)
+
+    if preprocess_scitldr:
+        task_ids["scitldr_train"] = _prepare_task(cache_paths["scitldr_train"], "SciTLDR Train")
+        task_ids["scitldr_validation"] = _prepare_task(cache_paths["scitldr_validation"], "SciTLDR Validation")
+
+        def _job_scitldr():
+            dataset = load_train_only(config.scitldr_dataset, config.scitldr_train_split, config.scitldr_max_samples)
+            if dataset is None:
+                _safe_update(task_ids["scitldr_train"], total=1, completed=1, description="[red]SciTLDR load failed")
+                _safe_update(task_ids["scitldr_validation"], total=1, completed=1, description="[red]SciTLDR load failed")
+                return
+            train_ds, val_ds = _split_dataset(dataset, val_fraction)
+            process_scitldr(train_ds, cache_paths["scitldr_train"], "SciTLDR Train", task_ids["scitldr_train"])
+            if val_ds is not None:
+                process_scitldr(val_ds, cache_paths["scitldr_validation"], "SciTLDR Validation", task_ids["scitldr_validation"])
+            else:
+                _safe_update(task_ids["scitldr_validation"], total=1, completed=1, description="[yellow]No validation split")
+
+        jobs.append(_job_scitldr)
+
+    if jobs:
+        max_workers = max(1, (os.cpu_count() or 4) - 2)
+        max_workers = min(max_workers, len(jobs))
+        with progress:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(job) for job in jobs]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        progress.console.print(f"[red]Preprocessing failed: {exc}")
+
+    return cache_paths
+
+
+class CachedIdeaDataset(Dataset):
+    def __init__(self, jsonl_path: Path):
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            self.samples = [json.loads(line) for line in f if line.strip()]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = self.samples[idx]
+        return {
+            "idea": torch.tensor(sample["idea"], dtype=torch.float32)
+        }
+
+
+class CachedAdapterDataset(Dataset):
+    def __init__(self, jsonl_path: Path, idea_key: str, target_ids_key: str, target_mask_key: str):
+        self.idea_key = idea_key
+        self.target_ids_key = target_ids_key
+        self.target_mask_key = target_mask_key
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            self.samples = [json.loads(line) for line in f if line.strip()]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = self.samples[idx]
+        return {
+            "idea": torch.tensor(sample[self.idea_key], dtype=torch.float32),
+            "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
+            "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
+        }
+
+
+class CachedSciTLDRPairs(Dataset):
+    def __init__(self, jsonl_path: Path):
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            self.samples = [json.loads(line) for line in f if line.strip()]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = self.samples[idx]
+        return {
+            "source_idea": torch.tensor(sample["source_idea"], dtype=torch.float32),
+            "target_idea": torch.tensor(sample["target_idea"], dtype=torch.float32),
+            "summary_ids": torch.tensor(sample["target_target_ids"], dtype=torch.long),
+            "summary_attention_mask": torch.tensor(sample["target_target_attention_mask"], dtype=torch.long)
+        }
+
+
+def collate_cached_ideas(batch: list, model = None, config = None) -> dict:
+    ideas = torch.stack([item["idea"] for item in batch])
+    
+    # Append STOP_LATENT if model is provided and use_stop_latent is enabled
+    if model is not None and getattr(config, "use_stop_latent", True):
+        stop_latent = model.get_stop_latent(device=ideas.device)
+        ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
+    
+    return {"idea": ideas}
+
+
+def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
+    ideas = torch.stack([item["idea"] for item in batch])
+    target_ids = torch.stack([item["target_ids"] for item in batch])
+    target_attention_mask = torch.stack([item["target_attention_mask"] for item in batch])
+    
+    # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
+    if model is not None and getattr(config, "use_stop_latent", True):
+        batch_size = ideas.size(0)
+        stop_latent = model.get_stop_latent(batch_size=batch_size, device=ideas.device)
+        eos_token_id = model.gpt2.config.eos_token_id
+        
+        # Append STOP_LATENT to ideas
+        ideas = torch.cat([ideas, stop_latent], dim=0)
+        
+        # Append EOS targets
+        eos_targets = torch.full((batch_size, 1), fill_value=eos_token_id, dtype=target_ids.dtype, device=target_ids.device)
+        target_ids = torch.cat([target_ids, eos_targets], dim=1)
+        
+        # Append attention for EOS
+        eos_attention = torch.ones((batch_size, 1), dtype=target_attention_mask.dtype, device=target_attention_mask.device)
+        target_attention_mask = torch.cat([target_attention_mask, eos_attention], dim=1)
+    
+    return {
+        "idea": ideas,
+        "target_ids": target_ids,
+        "target_attention_mask": target_attention_mask
+    }
+
+
+def collate_cached_pairs(batch: list, model = None, config = None) -> dict:
+    source_ideas = torch.stack([item["source_idea"] for item in batch])
+    target_ideas = torch.stack([item["target_idea"] for item in batch])
+    summary_ids = torch.stack([item["summary_ids"] for item in batch])
+    summary_attention_mask = torch.stack([item["summary_attention_mask"] for item in batch])
+    
+    # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
+    if model is not None and getattr(config, "use_stop_latent", True):
+        batch_size = source_ideas.size(0)
+        stop_latent = model.get_stop_latent(batch_size=batch_size, device=source_ideas.device)
+        eos_token_id = model.gpt2.config.eos_token_id
+        
+        # Append STOP_LATENT to both source and target ideas
+        source_ideas = torch.cat([source_ideas, stop_latent], dim=0)
+        target_ideas = torch.cat([target_ideas, stop_latent], dim=0)
+        
+        # Append EOS targets to summary_ids
+        eos_targets = torch.full((batch_size, 1), fill_value=eos_token_id, dtype=summary_ids.dtype, device=summary_ids.device)
+        summary_ids = torch.cat([summary_ids, eos_targets], dim=1)
+        
+        # Append attention for EOS
+        eos_attention = torch.ones((batch_size, 1), dtype=summary_attention_mask.dtype, device=summary_attention_mask.device)
+        summary_attention_mask = torch.cat([summary_attention_mask, eos_attention], dim=1)
+    
+    return {
+        "source_idea": source_ideas,
+        "target_idea": target_ideas,
+        "summary_ids": summary_ids,
+        "summary_attention_mask": summary_attention_mask
+    }
+
+
+def create_pretrain_middle_dataloaders(config, cache_paths: dict, model = None) -> DataLoader:
+    datasets = []
+    if cache_paths["wikitext_train"].exists():
+        datasets.append(CachedIdeaDataset(cache_paths["wikitext_train"]))
+    if cache_paths["arxiv_train"].exists():
+        datasets.append(CachedIdeaDataset(cache_paths["arxiv_train"]))
+    if cache_paths["english_pretrain_train"].exists():
+        datasets.append(CachedIdeaDataset(cache_paths["english_pretrain_train"]))
+    if cache_paths["scitldr_train"].exists():
+        scitldr = CachedAdapterDataset(
+            cache_paths["scitldr_train"],
+            idea_key="source_idea",
+            target_ids_key="source_target_ids",
+            target_mask_key="source_target_attention_mask"
+        )
+        datasets.append(scitldr)
+    combined = ConcatDataset(datasets)
+    
+    # Create collate function with model and config
+    collate_fn_partial = partial(collate_cached_ideas, model=model, config=config) if model is not None else collate_cached_ideas
+    
+    return DataLoader(
+        combined,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_partial,
+        num_workers=config.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
+
+def create_pretrain_adapter_dataloader(config, cache_paths: dict, model = None) -> DataLoader:
+    datasets = []
+    if cache_paths["wikitext_train"].exists():
+        datasets.append(CachedAdapterDataset(cache_paths["wikitext_train"], "idea", "target_ids", "target_attention_mask"))
+    if cache_paths["arxiv_train"].exists():
+        datasets.append(CachedAdapterDataset(cache_paths["arxiv_train"], "idea", "target_ids", "target_attention_mask"))
+    if cache_paths["english_pretrain_train"].exists():
+        datasets.append(CachedAdapterDataset(cache_paths["english_pretrain_train"], "idea", "target_ids", "target_attention_mask"))
+    if cache_paths["scitldr_train"].exists():
+        datasets.append(CachedAdapterDataset(cache_paths["scitldr_train"], "source_idea", "source_target_ids", "source_target_attention_mask"))
+    combined = ConcatDataset(datasets)
+    
+    # Create collate function with model and config
+    collate_fn_partial = partial(collate_cached_adapter, model=model, config=config) if model is not None else collate_cached_adapter
+    
+    return DataLoader(
+        combined,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_partial,
+        num_workers=config.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
+
+class SAMSumIdeaDataset(Dataset):
+    """Fine-tuning dataset: loads SAMSum dialogues + summaries, computes ideas on-the-fly."""
+    
+    def __init__(
+        self,
+        split: str = "train",
+        config = None,
+        device = None
+    ):
+        self.split = split
+        self.config = config
+        self.device = device or torch.device("cpu")
+        
+        # Load SAMSum dataset
+        print(f"Loading SAMSum {split} split for fine-tuning...")
+        self.dataset = load_dataset("knkarthick/samsum", split=split)
+        
+        # Tokenizers
+        self.modernbert_tokenizer = AutoTokenizer.from_pretrained(config.modernbert_model)
+        self.decoder_tokenizer = AutoTokenizer.from_pretrained(config.gpt2_model)
+        if self.decoder_tokenizer.pad_token is None:
+            self.decoder_tokenizer.pad_token = self.decoder_tokenizer.eos_token
+        
+        # Encoder for computing ideas
+        self.encoder = LatentEncoder(
+            model_name=config.modernbert_model,
+            hidden_dim=config.modernbert_hidden_dim,
+            latent_dim=config.latent_dim,
+            num_unfrozen_layers=0
+        ).to(self.device)
+        self.encoder.eval()
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        
+        # Precompute ideas for all samples
+        print(f"Computing ideas for {len(self.dataset)} SAMSum samples...")
+        self.ideas = []
+        self.summaries = []
+        self.target_ids_list = []
+        self.target_masks_list = []
+        
+        for idx, item in enumerate(self.dataset):
+            dialogue = item["dialogue"]
+            summary = item["summary"]
+            
+            # Compute idea for dialogue
+            dialogue_enc = self.modernbert_tokenizer(
+                dialogue,
+                max_length=config.max_seq_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            summary_enc = self.modernbert_tokenizer(
+                summary,
+                max_length=config.max_seq_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            
+            dialogue_ids = dialogue_enc["input_ids"].to(self.device)
+            dialogue_mask = dialogue_enc["attention_mask"].to(self.device)
+            summary_ids = summary_enc["input_ids"].to(self.device)
+            summary_mask = summary_enc["attention_mask"].to(self.device)
+            
+            with torch.no_grad():
+                dialogue_output = self.encoder.modernbert(input_ids=dialogue_ids, attention_mask=dialogue_mask)
+                summary_output = self.encoder.modernbert(input_ids=summary_ids, attention_mask=summary_mask)
+                dialogue_pooled = _mean_pooling(dialogue_output.last_hidden_state, dialogue_mask)
+                summary_pooled = _mean_pooling(summary_output.last_hidden_state, summary_mask)
+                dialogue_idea = self.encoder.compression_mlp(dialogue_pooled)
+                summary_idea = self.encoder.compression_mlp(summary_pooled)
+            
+            # Store ideas
+            self.ideas.append((dialogue_idea.cpu(), summary_idea.cpu()))
+            
+            # Tokenize summary for decoding
+            summary_target_enc = self.decoder_tokenizer(
+                summary,
+                max_length=config.max_target_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+            self.target_ids_list.append(summary_target_enc["input_ids"].squeeze(0))
+            self.target_masks_list.append(summary_target_enc["attention_mask"].squeeze(0))
+            
+            self.summaries.append(summary)
+            
+            if (idx + 1) % 100 == 0:
+                print(f"  Computed ideas for {idx+1}/{len(self.dataset)} samples")
+        
+        print(f"Loaded {len(self.dataset)} SAMSum samples for fine-tuning")
+    
+    def __len__(self) -> int:
+        return len(self.dataset)
+    
+    def __getitem__(self, idx: int) -> dict:
+        dialogue_idea, summary_idea = self.ideas[idx]
+        return {
+            "source_idea": dialogue_idea.squeeze(0) if dialogue_idea.dim() > 1 else dialogue_idea,
+            "target_idea": summary_idea.squeeze(0) if summary_idea.dim() > 1 else summary_idea,
+            "summary_ids": self.target_ids_list[idx],
+            "summary_attention_mask": self.target_masks_list[idx],
+            "summary": self.summaries[idx]
+        }
+
+
+def create_finetune_middle_dataloader(config, cache_paths: dict = None, model = None) -> DataLoader:
+    """Create dataloader for middle model fine-tuning with SAMSum."""
+    dataset = SAMSumIdeaDataset(split="train", config=config, device=torch.device(config.device if torch.cuda.is_available() else "cpu"))
+    
+    # Create collate function with model and config
+    collate_fn_partial = partial(collate_cached_pairs, model=model, config=config) if model is not None else collate_cached_pairs
+    
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_partial,
+        num_workers=0,  # Disable num_workers for on-the-fly idea computation
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
+
+def create_finetune_adapter_dataloader(config, cache_paths: dict = None, model = None) -> DataLoader:
+    """Create dataloader for adapter fine-tuning with SAMSum."""
+    dataset = SAMSumIdeaDataset(split="train", config=config, device=torch.device(config.device if torch.cuda.is_available() else "cpu"))
+    
+    # Create collate function with model and config
+    collate_fn_partial = partial(collate_cached_pairs, model=model, config=config) if model is not None else collate_cached_pairs
+    
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_partial,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+
+
+def create_finetune_adapter_dataloaders(config, cache_paths: dict = None, model = None) -> tuple[DataLoader, DataLoader]:
+    """Create train and validation dataloaders for adapter fine-tuning with SAMSum."""
+    train_dataset = SAMSumIdeaDataset(split="train", config=config, device=torch.device(config.device if torch.cuda.is_available() else "cpu"))
+    val_dataset = SAMSumIdeaDataset(split="validation", config=config, device=torch.device(config.device if torch.cuda.is_available() else "cpu"))
+    
+    # Create collate function with model and config
+    collate_fn_partial = partial(collate_cached_pairs, model=model, config=config) if model is not None else collate_cached_pairs
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_partial,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn_partial,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
     return train_loader, val_loader
