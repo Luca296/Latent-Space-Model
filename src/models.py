@@ -464,13 +464,14 @@ class LatentSpaceModel(nn.Module):
         
         # Initialize generation with prefix
         current_embeds = prefix_embeddings
-        generated_ids_list = []  # List to collect generated tokens
+        generated_ids_list = []  # List to collect generated tokens per sequence
         has_eos = stop_mask.clone()  # Track which sequences have hit EOS or STOP_LATENT
+        sequence_lengths = torch.full((batch_size,), max_length, dtype=torch.long, device=device)
 
         if has_eos.all():
             return torch.full((batch_size, 1), eos_token_id, dtype=torch.long, device=device)
         
-        for i in range(max_length):
+        for step in range(max_length):
             # Run GPT-2 on current embeddings
             with torch.no_grad():
                 outputs = self.gpt2(inputs_embeds=current_embeds)
@@ -506,21 +507,25 @@ class LatentSpaceModel(nn.Module):
             else:
                 next_token = torch.argmax(logits, dim=-1)
             
-            # Enforce EOS for sequences that already stopped
-            if has_eos.any():
-                next_token = torch.where(has_eos, torch.full_like(next_token, eos_token_id), next_token)
-
-            # Store generated token
-            generated_ids_list.append(next_token)
-
-            # Check for EOS and stop early if any sequence has generated EOS
+            # Check for EOS before storing (this determines when to stop)
             is_eos = next_token == eos_token_id
+            
+            # Store generated token (including EOS token if generated)
+            generated_ids_list.append(next_token)
+            
+            # Mark sequences that just generated EOS
+            newly_stopped = is_eos & ~has_eos
+            if newly_stopped.any():
+                sequence_lengths = torch.where(newly_stopped, torch.full_like(sequence_lengths, step + 1), sequence_lengths)
+            
+            # Update overall stopping mask
             has_eos = has_eos | is_eos
-            # Stop generation as soon as any EOS is produced
-            if is_eos.any():
+            
+            # Stop generation loop if all sequences have generated EOS
+            if has_eos.all():
                 break
             
-            # Get embedding for next token and append
+            # Get embedding for next token and append (only for non-stopped sequences to be efficient)
             next_token_embed = self.gpt2_embeddings(next_token).unsqueeze(1)  # [B, 1, gpt2_hidden_dim]
             # Cast to decoder model dtype (handles BFloat16, Float16, etc.)
             model_dtype = next(self.gpt2.parameters()).dtype
