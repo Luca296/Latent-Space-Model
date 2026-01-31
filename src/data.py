@@ -545,8 +545,8 @@ def preprocess_and_cache_datasets(config) -> dict:
         if getattr(config, "preprocess_scitldr", False) and hasattr(config, "scitldr_dataset"):
             required += [cache_paths["scitldr_train"], cache_paths["scitldr_validation"]]
         required += [cache_paths["compression_mlp"]]
-        if all(p.exists() for p in required):
-            return cache_paths
+        # NOTE: We intentionally do NOT return early here. Cached files can be partial
+        # (e.g., after an interrupted run), so we validate completeness per dataset below.
 
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
 
@@ -599,10 +599,27 @@ def preprocess_and_cache_datasets(config) -> dict:
         with progress_lock:
             return progress.add_task(f"{label}: {output_path.name}", total=1)
 
-    def process_single_text_dataset(dataset, output_path: Path, label: str, task_id: int):
+    def _jsonl_line_count(path: Path) -> int:
+        if not path.exists():
+            return 0
+        count = 0
+        with path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                count += 1
+        return count
+
+    def process_single_text_dataset(dataset, output_path: Path, label: str, task_id: int, expected_rows: int):
         if output_path.exists():
-            _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
-            return
+            cached_rows = _jsonl_line_count(output_path)
+            if expected_rows > 0 and cached_rows >= expected_rows:
+                _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+                return
+            _safe_update(
+                task_id,
+                total=1,
+                completed=0,
+                description=f"[yellow]Cached {output_path.name} incomplete ({cached_rows}/{expected_rows}); regenerating"
+            )
 
         rows = []
         batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
@@ -614,7 +631,7 @@ def preprocess_and_cache_datasets(config) -> dict:
             texts = []
             for i in range(len(next(iter(batch.values())))):
                 text = None
-                for key in ["text", "query"]:
+                for key in ["text", "query", "abstract", "content", "article", "body", "title"]:
                     if key in batch and batch[key][i]:
                         text = batch[key][i]
                         break
@@ -663,10 +680,18 @@ def preprocess_and_cache_datasets(config) -> dict:
         _write_jsonl(output_path, rows)
         _finish_task(task_id, f"[green]Cached {output_path.name}")
 
-    def process_scitldr(dataset, output_path: Path, label: str, task_id: int):
+    def process_scitldr(dataset, output_path: Path, label: str, task_id: int, expected_rows: int):
         if output_path.exists():
-            _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
-            return
+            cached_rows = _jsonl_line_count(output_path)
+            if expected_rows > 0 and cached_rows >= expected_rows:
+                _safe_update(task_id, total=1, completed=1, description=f"[green]Cached {output_path.name} (skipped)")
+                return
+            _safe_update(
+                task_id,
+                total=1,
+                completed=0,
+                description=f"[yellow]Cached {output_path.name} incomplete ({cached_rows}/{expected_rows}); regenerating"
+            )
 
         rows = []
         batch_size = max(1, int(getattr(config, "preprocess_batch_size", 16)))
@@ -787,9 +812,21 @@ def preprocess_and_cache_datasets(config) -> dict:
                 _safe_update(task_ids["wikitext_validation"], total=1, completed=1, description="[red]WikiText load failed")
                 return
             train_ds, val_ds = _split_dataset(dataset, val_fraction)
-            process_single_text_dataset(train_ds, cache_paths["wikitext_train"], "WikiText Train", task_ids["wikitext_train"])
+            process_single_text_dataset(
+                train_ds,
+                cache_paths["wikitext_train"],
+                "WikiText Train",
+                task_ids["wikitext_train"],
+                expected_rows=len(train_ds)
+            )
             if val_ds is not None:
-                process_single_text_dataset(val_ds, cache_paths["wikitext_validation"], "WikiText Validation", task_ids["wikitext_validation"])
+                process_single_text_dataset(
+                    val_ds,
+                    cache_paths["wikitext_validation"],
+                    "WikiText Validation",
+                    task_ids["wikitext_validation"],
+                    expected_rows=len(val_ds)
+                )
             else:
                 _safe_update(task_ids["wikitext_validation"], total=1, completed=1, description="[yellow]No validation split")
 
@@ -806,9 +843,21 @@ def preprocess_and_cache_datasets(config) -> dict:
                 _safe_update(task_ids["arxiv_validation"], total=1, completed=1, description="[red]arXiv load failed")
                 return
             train_ds, val_ds = _split_dataset(dataset, val_fraction)
-            process_single_text_dataset(train_ds, cache_paths["arxiv_train"], "arXiv Train", task_ids["arxiv_train"])
+            process_single_text_dataset(
+                train_ds,
+                cache_paths["arxiv_train"],
+                "arXiv Train",
+                task_ids["arxiv_train"],
+                expected_rows=len(train_ds)
+            )
             if val_ds is not None:
-                process_single_text_dataset(val_ds, cache_paths["arxiv_validation"], "arXiv Validation", task_ids["arxiv_validation"])
+                process_single_text_dataset(
+                    val_ds,
+                    cache_paths["arxiv_validation"],
+                    "arXiv Validation",
+                    task_ids["arxiv_validation"],
+                    expected_rows=len(val_ds)
+                )
             else:
                 _safe_update(task_ids["arxiv_validation"], total=1, completed=1, description="[yellow]No validation split")
 
@@ -833,14 +882,16 @@ def preprocess_and_cache_datasets(config) -> dict:
                 train_ds,
                 cache_paths["english_pretrain_train"],
                 "English Pretrain Train",
-                task_ids["english_pretrain_train"]
+                task_ids["english_pretrain_train"],
+                expected_rows=len(train_ds)
             )
             if val_ds is not None:
                 process_single_text_dataset(
                     val_ds,
                     cache_paths["english_pretrain_validation"],
                     "English Pretrain Validation",
-                    task_ids["english_pretrain_validation"]
+                    task_ids["english_pretrain_validation"],
+                    expected_rows=len(val_ds)
                 )
             else:
                 _safe_update(task_ids["english_pretrain_validation"], total=1, completed=1, description="[yellow]No validation split")
@@ -858,9 +909,21 @@ def preprocess_and_cache_datasets(config) -> dict:
                 _safe_update(task_ids["scitldr_validation"], total=1, completed=1, description="[red]SciTLDR load failed")
                 return
             train_ds, val_ds = _split_dataset(dataset, val_fraction)
-            process_scitldr(train_ds, cache_paths["scitldr_train"], "SciTLDR Train", task_ids["scitldr_train"])
+            process_scitldr(
+                train_ds,
+                cache_paths["scitldr_train"],
+                "SciTLDR Train",
+                task_ids["scitldr_train"],
+                expected_rows=len(train_ds)
+            )
             if val_ds is not None:
-                process_scitldr(val_ds, cache_paths["scitldr_validation"], "SciTLDR Validation", task_ids["scitldr_validation"])
+                process_scitldr(
+                    val_ds,
+                    cache_paths["scitldr_validation"],
+                    "SciTLDR Validation",
+                    task_ids["scitldr_validation"],
+                    expected_rows=len(val_ds)
+                )
             else:
                 _safe_update(task_ids["scitldr_validation"], total=1, completed=1, description="[yellow]No validation split")
 
