@@ -11,11 +11,20 @@ class Config:
     
     # Model dimensions
     latent_dim: int = 256
+    latent_seq_len: int = 8  # Fixed-length latent sequence length
     prefix_len: int = 50  # Restored to larger default to provide longer prefix context
     modernbert_hidden_dim: int = 768
     gpt2_hidden_dim: int = 640  # Gemma-3-270m hidden dimension
     middle_hidden_dim: int = 512
     middle_layers: int = 4
+    middle_transformer_layers: int = 4
+    middle_num_heads: int = 4
+    middle_ffn_multiplier: float = 4.0
+    middle_dropout: float = 0.1
+    middle_use_rope: bool = True
+    adapter_num_heads: int = 4
+    adapter_dropout: float = 0.1
+    adapter_use_rope: bool = True
     num_encoder_unfrozen_layers: int = 2  # Number of top ModernBERT layers to unfreeze in Phase 2
     
     # Training hyperparameters

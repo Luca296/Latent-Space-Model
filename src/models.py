@@ -2,9 +2,9 @@
 Model architecture for latent-space reasoning.
 
 Components:
-- LatentEncoder: ModernBERT + pooling + compression MLP
-- MiddleModel: MLP for latent reasoning
-- PrefixAdapter: Expands latent to GPT-2 prefix embeddings
+- LatentEncoder: ModernBERT + pooling + projection to latent sequence
+- MiddleTransformer: Transformer for latent reasoning over sequences
+- PrefixAdapter: Cross-attention from latent sequence to prefix embeddings
 - LatentSpaceModel: Combined model
 """
 
@@ -15,15 +15,21 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM
 
 
-def _init_stop_latent(latent_dim: int, init: str = "random_normalized", seed: int = 1337) -> torch.Tensor:
+def _init_stop_latent(
+    latent_seq_len: int,
+    latent_dim: int,
+    init: str = "random_normalized",
+    seed: int = 1337
+) -> torch.Tensor:
     if init == "zero":
-        return torch.zeros(latent_dim)
+        return torch.zeros(latent_seq_len, latent_dim)
     if init == "random_normalized":
         generator = torch.Generator()
         if seed is not None:
             generator.manual_seed(seed)
-        vec = torch.randn(latent_dim, generator=generator)
-        return vec / vec.norm(p=2).clamp(min=1e-9)
+        vec = torch.randn(latent_seq_len, latent_dim, generator=generator)
+        denom = vec.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)
+        return vec / denom
     raise ValueError(f"Unsupported stop_latent_init: {init}")
 
 
@@ -83,9 +89,10 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 class LatentEncoder(nn.Module):
-    """Encoder that converts text tokens to a compact idea vector."""
+    """Encoder that converts text tokens to a compact latent sequence."""
     
     def __init__(self, model_name: str, hidden_dim: int = 768, latent_dim: int = 256,
+                 latent_seq_len: int = 8,
                  num_unfrozen_layers: int = 0, attn_implementation: str | None = None,
                  use_gradient_checkpointing: bool = False):
         super().__init__()
@@ -98,14 +105,18 @@ class LatentEncoder(nn.Module):
             self.modernbert = AutoModel.from_pretrained(model_name)
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.latent_seq_len = latent_seq_len
         self.num_unfrozen_layers = num_unfrozen_layers
         
-        # Compression MLP: hidden_dim -> 512 -> latent_dim
-        self.compression_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, 512),
+        # Projection from pooled embedding to latent sequence
+        seq_out_dim = latent_seq_len * latent_dim
+        self.sequence_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(512, latent_dim)
+            nn.Linear(hidden_dim, seq_out_dim)
         )
+        # Backwards-compatible name used by preprocessing cache
+        self.compression_mlp = self.sequence_proj
         
         # Freeze ModernBERT backbone by default
         for param in self.modernbert.parameters():
@@ -158,6 +169,12 @@ class LatentEncoder(nn.Module):
         
         return pooled
     
+    def project_to_latent_sequence(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Project pooled embeddings to a latent sequence."""
+        batch_size = pooled.size(0)
+        seq = self.sequence_proj(pooled)
+        return seq.view(batch_size, self.latent_seq_len, self.latent_dim)
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the encoder.
@@ -167,7 +184,7 @@ class LatentEncoder(nn.Module):
             attention_mask: [B, L] attention mask
             
         Returns:
-            z_in: [B, latent_dim] idea vector
+            z_in: [B, latent_seq_len, latent_dim] latent sequence
         """
         # Check if any modernbert parameters require grad (unfrozen layers)
         has_unfrozen_layers = any(p.requires_grad for p in self.modernbert.parameters())
@@ -185,54 +202,169 @@ class LatentEncoder(nn.Module):
         # Pool hidden states
         pooled = self.mean_pooling(hidden_states, attention_mask)  # [B, hidden_dim]
         
-        # Compress to latent space
-        z_in = self.compression_mlp(pooled)  # [B, latent_dim]
+        # Project to latent sequence
+        z_in = self.project_to_latent_sequence(pooled)  # [B, latent_seq_len, latent_dim]
         
         return z_in
 
 
-class MiddleModel(nn.Module):
-    """MLP for latent reasoning in idea space."""
-    
-    def __init__(self, latent_dim: int = 256, hidden_dim: int = 512, num_layers: int = 3):
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention with optional RoPE."""
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, use_rope: bool = True, rope_base: int = 10000):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("Attention dim must be divisible by num_heads")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        if use_rope and self.head_dim % 2 != 0:
+            raise ValueError("RoPE requires even head dimension")
+        self.use_rope = use_rope
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, base=rope_base) if use_rope else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        if self.use_rope:
+            cos, sin = self.rope(seq_len, x.device, x.dtype)
+            q = apply_rope(q.reshape(batch_size * self.num_heads, seq_len, self.head_dim), cos, sin)
+            k = apply_rope(k.reshape(batch_size * self.num_heads, seq_len, self.head_dim), cos, sin)
+            q = q.view(batch_size, self.num_heads, seq_len, self.head_dim)
+            k = k.view(batch_size, self.num_heads, seq_len, self.head_dim)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+
+        v = v.transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
+        return self.out_proj(attn_output)
+
+
+class MultiHeadCrossAttention(nn.Module):
+    """Multi-head cross-attention with optional RoPE."""
+
+    def __init__(self, q_dim: int, kv_dim: int, num_heads: int, dropout: float = 0.0, use_rope: bool = True, rope_base: int = 10000):
+        super().__init__()
+        if q_dim % num_heads != 0:
+            raise ValueError("Query dim must be divisible by num_heads")
+        self.q_dim = q_dim
+        self.kv_dim = kv_dim
+        self.num_heads = num_heads
+        self.head_dim = q_dim // num_heads
+        if use_rope and self.head_dim % 2 != 0:
+            raise ValueError("RoPE requires even head dimension")
+        self.use_rope = use_rope
+        self.q_proj = nn.Linear(q_dim, q_dim, bias=True)
+        self.k_proj = nn.Linear(kv_dim, q_dim, bias=True)
+        self.v_proj = nn.Linear(kv_dim, q_dim, bias=True)
+        self.out_proj = nn.Linear(q_dim, q_dim, bias=True)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, base=rope_base) if use_rope else None
+
+    def forward(self, queries: torch.Tensor, keys_values: torch.Tensor) -> torch.Tensor:
+        batch_size, q_len, _ = queries.shape
+        kv_len = keys_values.size(1)
+        q = self.q_proj(queries)
+        k = self.k_proj(keys_values)
+        v = self.v_proj(keys_values)
+
+        q = q.view(batch_size, q_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, kv_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, kv_len, self.num_heads, self.head_dim)
+
+        if self.use_rope:
+            q_cos, q_sin = self.rope(q_len, queries.device, queries.dtype)
+            k_cos, k_sin = self.rope(kv_len, keys_values.device, keys_values.dtype)
+            q = apply_rope(q.reshape(batch_size * self.num_heads, q_len, self.head_dim), q_cos, q_sin)
+            k = apply_rope(k.reshape(batch_size * self.num_heads, kv_len, self.head_dim), k_cos, k_sin)
+            q = q.view(batch_size, self.num_heads, q_len, self.head_dim)
+            k = k.view(batch_size, self.num_heads, kv_len, self.head_dim)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+
+        v = v.transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, q_len, self.q_dim)
+        return self.out_proj(attn_output)
+
+
+class TransformerBlock(nn.Module):
+    """Transformer block for latent reasoning."""
+
+    def __init__(self, dim: int, num_heads: int, ffn_multiplier: float = 4.0, dropout: float = 0.0, use_rope: bool = True, rope_base: int = 10000):
+        super().__init__()
+        hidden_dim = int(dim * ffn_multiplier)
+        self.norm1 = RMSNorm(dim, eps=1e-6)
+        self.attn = MultiHeadSelfAttention(dim, num_heads, dropout=dropout, use_rope=use_rope, rope_base=rope_base)
+        self.norm2 = RMSNorm(dim, eps=1e-6)
+        self.ffn = nn.Sequential(
+            SwiGLU(dim, hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class MiddleTransformer(nn.Module):
+    """Transformer for latent reasoning over sequences."""
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        ffn_multiplier: float = 4.0,
+        dropout: float = 0.1,
+        use_rope: bool = True,
+        rope_base: int = 10000
+    ):
         super().__init__()
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                dim=latent_dim,
+                num_heads=num_heads,
+                ffn_multiplier=ffn_multiplier,
+                dropout=dropout,
+                use_rope=use_rope,
+                rope_base=rope_base
+            )
+            for _ in range(num_layers)
+        ])
 
-        layers = []
-        for i in range(num_layers):
-            if i == 0:
-                in_dim = latent_dim
-                out_dim = hidden_dim
-            elif i == num_layers - 1:
-                in_dim = hidden_dim
-                out_dim = latent_dim
-            else:
-                in_dim = hidden_dim
-                out_dim = hidden_dim
-
-            if i < num_layers - 1:
-                layers.append(nn.Sequential(
-                    RMSNorm(in_dim, eps=1e-6),
-                    SwiGLU(in_dim, out_dim)
-                ))
-            else:
-                layers.append(nn.Sequential(
-                    RMSNorm(in_dim, eps=1e-6),
-                    nn.Linear(in_dim, out_dim)
-                ))
-
-        self.layers = nn.ModuleList(layers)
-    
     def forward(self, z_in: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the middle model.
-        
+
         Args:
-            z_in: [B, latent_dim] input idea vector
-            
+            z_in: [B, latent_seq_len, latent_dim] input latent sequence
+
         Returns:
-            z_out: [B, latent_dim] transformed idea vector
+            z_out: [B, latent_seq_len, latent_dim] transformed latent sequence
         """
         z_out = z_in
         for layer in self.layers:
@@ -241,44 +373,54 @@ class MiddleModel(nn.Module):
 
 
 class PrefixAdapter(nn.Module):
-    """Expands latent vector to GPT-2 prefix embeddings."""
-    
-    def __init__(self, latent_dim: int = 256, prefix_len: int = 10, gpt2_hidden_dim: int = 768):
+    """Cross-attend from latent sequence to GPT-2/Gemma prefix embeddings."""
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        prefix_len: int = 10,
+        gpt2_hidden_dim: int = 768,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        use_rope: bool = True,
+        rope_base: int = 10000
+    ):
         super().__init__()
         self.latent_dim = latent_dim
         self.prefix_len = prefix_len
         self.gpt2_hidden_dim = gpt2_hidden_dim
-        
-        # Deeper expansion MLP with RMSNorm + SwiGLU (no final activation)
-        output_dim = prefix_len * gpt2_hidden_dim
-        self.expansion_mlp = nn.Sequential(
-            RMSNorm(latent_dim, eps=1e-6),
-            SwiGLU(latent_dim, 1024),
-            RMSNorm(1024, eps=1e-6),
-            SwiGLU(1024, 2048),
-            RMSNorm(2048, eps=1e-6),
-            nn.Linear(2048, output_dim)
+        self.query_embed = nn.Parameter(torch.randn(prefix_len, gpt2_hidden_dim) * 0.02)
+        self.cross_attn = MultiHeadCrossAttention(
+            q_dim=gpt2_hidden_dim,
+            kv_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_rope=use_rope,
+            rope_base=rope_base
         )
-    
+        self.norm = RMSNorm(gpt2_hidden_dim, eps=1e-6)
+        self.ffn = nn.Sequential(
+            SwiGLU(gpt2_hidden_dim, gpt2_hidden_dim * 4),
+            nn.Dropout(dropout),
+            nn.Linear(gpt2_hidden_dim * 4, gpt2_hidden_dim),
+            nn.Dropout(dropout)
+        )
+
     def forward(self, z_out: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of the prefix adapter.
-        
+
         Args:
-            z_out: [B, latent_dim] transformed idea vector
-            
+            z_out: [B, latent_seq_len, latent_dim] transformed latent sequence
+
         Returns:
             prefix_embeddings: [B, prefix_len, gpt2_hidden_dim] prefix embeddings
         """
         batch_size = z_out.size(0)
-        
-        # Direct expansion without L2 normalization (preserves magnitude information)
-        expanded = self.expansion_mlp(z_out)  # [B, prefix_len * gpt2_hidden_dim]
-        
-        # Reshape to prefix embeddings
-        prefix_embeddings = expanded.view(batch_size, self.prefix_len, self.gpt2_hidden_dim)
-        
-        return prefix_embeddings
+        queries = self.query_embed.unsqueeze(0).expand(batch_size, -1, -1)
+        attended = self.cross_attn(queries, z_out)
+        attended = attended + self.ffn(self.norm(attended))
+        return attended
 
 
 class LatentSpaceModel(nn.Module):
@@ -307,21 +449,30 @@ class LatentSpaceModel(nn.Module):
             model_name=config.modernbert_model,
             hidden_dim=config.modernbert_hidden_dim,
             latent_dim=config.latent_dim,
+            latent_seq_len=getattr(config, "latent_seq_len", 8),
             num_unfrozen_layers=getattr(config, 'num_encoder_unfrozen_layers', 0),
             attn_implementation=attn_impl,
             use_gradient_checkpointing=use_gc
         )
-        
-        self.middle_model = MiddleModel(
+
+        self.middle_model = MiddleTransformer(
             latent_dim=config.latent_dim,
-            hidden_dim=config.middle_hidden_dim,
-            num_layers=config.middle_layers
+            num_layers=getattr(config, "middle_transformer_layers", config.middle_layers),
+            num_heads=getattr(config, "middle_num_heads", 4),
+            ffn_multiplier=getattr(config, "middle_ffn_multiplier", 4.0),
+            dropout=getattr(config, "middle_dropout", 0.1),
+            use_rope=getattr(config, "middle_use_rope", True),
+            rope_base=getattr(config, "rope_base", 10000)
         )
         
         self.prefix_adapter = PrefixAdapter(
             latent_dim=config.latent_dim,
             prefix_len=config.prefix_len,
-            gpt2_hidden_dim=config.gpt2_hidden_dim
+            gpt2_hidden_dim=config.gpt2_hidden_dim,
+            num_heads=getattr(config, "adapter_num_heads", getattr(config, "middle_num_heads", 4)),
+            dropout=getattr(config, "adapter_dropout", 0.1),
+            use_rope=getattr(config, "adapter_use_rope", True),
+            rope_base=getattr(config, "rope_base", 10000)
         )
         # Norm to match decoder embedding normalization
         if getattr(config, "use_rmsnorm", True):
@@ -350,6 +501,7 @@ class LatentSpaceModel(nn.Module):
 
         # Fixed STOP latent vector
         stop_latent = _init_stop_latent(
+            latent_seq_len=getattr(config, "latent_seq_len", 8),
             latent_dim=config.latent_dim,
             init=getattr(config, "stop_latent_init", "random_normalized"),
             seed=getattr(config, "stop_latent_seed", 1337)
@@ -384,8 +536,15 @@ class LatentSpaceModel(nn.Module):
         if device is not None:
             stop_latent = stop_latent.to(device)
         if batch_size is not None:
-            return stop_latent.unsqueeze(0).expand(batch_size, -1)
+            return stop_latent.unsqueeze(0).expand(batch_size, -1, -1)
         return stop_latent
+
+    def _reduce_latent_for_stop(self, z_out: torch.Tensor) -> torch.Tensor:
+        if z_out.dim() == 3:
+            return z_out.mean(dim=1)
+        if z_out.dim() == 2:
+            return z_out.mean(dim=0, keepdim=True)
+        return z_out
 
     def is_stop_latent(
         self,
@@ -395,6 +554,8 @@ class LatentSpaceModel(nn.Module):
     ) -> torch.Tensor:
         if z_out.dim() == 1:
             z_out = z_out.unsqueeze(0)
+        if z_out.dim() == 2:
+            z_out = z_out.unsqueeze(0)
         stop_latent = self.get_stop_latent(batch_size=z_out.size(0), device=z_out.device)
 
         use_cosine = cosine_threshold is not None
@@ -402,10 +563,14 @@ class LatentSpaceModel(nn.Module):
 
         stop_mask = torch.zeros(z_out.size(0), dtype=torch.bool, device=z_out.device)
         if use_cosine:
-            cosine_sim = F.cosine_similarity(z_out, stop_latent, dim=-1)
+            pooled = self._reduce_latent_for_stop(z_out)
+            stop_pooled = self._reduce_latent_for_stop(stop_latent)
+            cosine_sim = F.cosine_similarity(pooled, stop_pooled, dim=-1)
             stop_mask = stop_mask | (cosine_sim >= cosine_threshold)
         if use_l2:
-            l2_dist = torch.norm(z_out - stop_latent, dim=-1)
+            pooled = self._reduce_latent_for_stop(z_out)
+            stop_pooled = self._reduce_latent_for_stop(stop_latent)
+            l2_dist = torch.norm(pooled - stop_pooled, dim=-1)
             stop_mask = stop_mask | (l2_dist <= l2_threshold)
         return stop_mask
     
@@ -429,7 +594,7 @@ class LatentSpaceModel(nn.Module):
             logits: [B, T, vocab_size] decoder logits
         """
         # Encode input to latent space
-        z_in = self.encoder(input_ids, attention_mask)  # [B, latent_dim]
+        z_in = self.encoder(input_ids, attention_mask)  # [B, latent_seq_len, latent_dim]
 
         # Transform latent with middle model (or bypass for Phases 1 & 2)
         if self.bypass_middle:
@@ -460,7 +625,7 @@ class LatentSpaceModel(nn.Module):
         target_ids: torch.Tensor,
         target_attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Decode from latent vector into logits."""
+        """Decode from latent sequence into logits."""
 
         # Optional L2-normalization of latent vectors before decoding/expansion
         if getattr(self.config, 'normalize_latent', False):
@@ -521,7 +686,7 @@ class LatentSpaceModel(nn.Module):
         return z_out
     
     def get_prefix_embeddings(self, z_out: torch.Tensor) -> torch.Tensor:
-        """Get prefix embeddings from latent vector (for inference)."""
+        """Get prefix embeddings from latent sequence (for inference)."""
         # Normalize latent vectors before expansion if configured
         if getattr(self.config, 'normalize_latent', False):
             denom = z_out.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)

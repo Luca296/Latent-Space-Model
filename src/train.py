@@ -176,6 +176,10 @@ def compute_loss(logits: torch.Tensor, target_ids: torch.Tensor,
 
 
 def compute_contrastive_loss(z_pred: torch.Tensor, z_target: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+    if z_pred.dim() == 3:
+        z_pred = z_pred.mean(dim=1)
+    if z_target.dim() == 3:
+        z_target = z_target.mean(dim=1)
     z_pred = F.normalize(z_pred, dim=-1)
     z_target = F.normalize(z_target, dim=-1)
     logits = torch.matmul(z_pred, z_target.t()) / temperature

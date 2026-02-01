@@ -702,7 +702,7 @@ def preprocess_and_cache_datasets(config) -> dict:
                     outputs = encoder.modernbert(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state
                     pooled = _mean_pooling(hidden_states, attention_mask)
-                    ideas = encoder.compression_mlp(pooled)
+                    ideas = encoder.project_to_latent_sequence(pooled)
 
                 for i in range(len(texts)):
                     embedding_fp16 = _to_float16_list(pooled[i])
@@ -801,8 +801,8 @@ def preprocess_and_cache_datasets(config) -> dict:
                     target_outputs = encoder.modernbert(input_ids=target_input_ids, attention_mask=target_attention)
                     source_pooled = _mean_pooling(source_outputs.last_hidden_state, source_attention)
                     target_pooled = _mean_pooling(target_outputs.last_hidden_state, target_attention)
-                    source_ideas = encoder.compression_mlp(source_pooled)
-                    target_ideas = encoder.compression_mlp(target_pooled)
+                    source_ideas = encoder.project_to_latent_sequence(source_pooled)
+                    target_ideas = encoder.project_to_latent_sequence(target_pooled)
 
                 for i in range(len(sources)):
                     source_embedding_fp16 = _to_float16_list(source_pooled[i])
@@ -1337,8 +1337,8 @@ class SAMSumIdeaDataset(Dataset):
                 summary_output = self.encoder.modernbert(input_ids=summary_ids, attention_mask=summary_mask)
                 dialogue_pooled = _mean_pooling(dialogue_output.last_hidden_state, dialogue_mask)
                 summary_pooled = _mean_pooling(summary_output.last_hidden_state, summary_mask)
-                dialogue_idea = self.encoder.compression_mlp(dialogue_pooled)
-                summary_idea = self.encoder.compression_mlp(summary_pooled)
+                dialogue_idea = self.encoder.project_to_latent_sequence(dialogue_pooled)
+                summary_idea = self.encoder.project_to_latent_sequence(summary_pooled)
             
             # Store ideas
             self.ideas.append((dialogue_idea.cpu(), summary_idea.cpu()))

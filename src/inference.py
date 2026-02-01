@@ -161,13 +161,13 @@ class LatentSpaceInference:
     
     def get_latent_vector(self, input_text: str) -> torch.Tensor:
         """
-        Get the latent vector for an input text.
+        Get the latent sequence for an input text.
         
         Args:
             input_text: Input text to encode
             
         Returns:
-            Latent vector [latent_dim]
+            Latent sequence [latent_seq_len, latent_dim]
         """
         # Tokenize input
         input_encoding = self.modernbert_tokenizer(
@@ -197,7 +197,7 @@ class LatentSpaceInference:
         do_sample: bool = None
     ) -> str:
         """
-        Interpolate between two latent vectors and generate text.
+        Interpolate between two latent sequences and generate text.
         
         Args:
             input_text_1: First input text
@@ -210,7 +210,7 @@ class LatentSpaceInference:
         Returns:
             Generated text from interpolated latent
         """
-        # Get latent vectors
+        # Get latent sequences
         z1 = self.get_latent_vector(input_text_1).unsqueeze(0).to(self.device)
         z2 = self.get_latent_vector(input_text_2).unsqueeze(0).to(self.device)
         
