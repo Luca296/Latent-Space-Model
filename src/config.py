@@ -20,10 +20,10 @@ class Config:
     
     # Training hyperparameters
     learning_rate: float = 2e-5
-    batch_size: int = 22
-    gradient_accumulation_steps: int = 2
-    max_seq_len: int = 1024
-    max_target_len: int = 512
+    batch_size: int = 10
+    gradient_accumulation_steps: int = 6
+    max_seq_len: int = 512
+    max_target_len: int = 256
     num_workers: int = 4  # Number of workers for data loading
     
     # Model names
@@ -38,6 +38,7 @@ class Config:
     # Device settings
     device: str = "cuda"  # Will be set automatically based on availability
     use_fp16: bool = True
+    use_gradient_checkpointing: bool = True  # Reduce memory usage during backward pass
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -100,10 +101,33 @@ class Config:
     adapter_pretrain_use_middle: bool = False
 
     # Stage-specific epochs
-    pretrain_middle_epochs: int = 6
-    pretrain_adapter_epochs: int = 10
+    pretrain_middle_epochs: int = 3
+    pretrain_adapter_epochs: int = 3
     finetune_middle_epochs: int = 2
     finetune_adapter_epochs: int = 2
+
+    # Stage-specific batch sizes (None = use global batch_size)
+    pretrain_middle_batch_size: int | None = None
+    pretrain_adapter_batch_size: int | None = None
+    finetune_middle_batch_size: int | None = None
+    finetune_adapter_batch_size: int | None = None
+
+    # Stage-specific max samples (None = use all available)
+    pretrain_middle_max_samples: int | None = None
+    pretrain_adapter_max_samples: int | None = None
+    finetune_middle_max_samples: int | None = None
+    finetune_adapter_max_samples: int | None = None
+
+    # Per-dataset caps (override stage-level caps when set)
+    pretrain_middle_max_samples_wikitext: int | None = None
+    pretrain_middle_max_samples_arxiv: int | None = None
+    pretrain_middle_max_samples_english: int | None = None
+    pretrain_middle_max_samples_scitldr: int | None = None
+
+    pretrain_adapter_max_samples_wikitext: int | None = 150000
+    pretrain_adapter_max_samples_arxiv: int | None = 150000
+    pretrain_adapter_max_samples_english: int | None = None
+    pretrain_adapter_max_samples_scitldr: int | None = None
 
     # Combined objective weights (middle model)
     latent_mse_weight: float = 1.0
