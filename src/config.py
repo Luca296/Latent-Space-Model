@@ -113,6 +113,19 @@ class Config:
     preprocess_english_pretrain: bool = True
     preprocess_validation_fraction: float = 0.05
 
+    # Cache field controls (minimal by default)
+    cache_store_text: bool = False
+    cache_store_input_ids: bool = False
+    cache_store_attention_mask: bool = False
+    cache_store_target_ids: bool = True
+    cache_store_target_attention_mask: bool = True
+    cache_store_embeddings_fp16: bool = False
+    cache_store_embeddings_int8: bool = True
+    cache_store_ideas_fp16: bool = False
+    cache_store_ideas_int8: bool = False
+    cache_use_embeddings_for_training: bool = True
+    cache_write_offsets_index: bool = True
+
     # Pipeline control
     pipeline_mode: str = "two_stage_scientific"  # "two_stage_scientific" or "legacy"
     run_preprocessing: bool = True

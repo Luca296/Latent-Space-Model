@@ -539,7 +539,7 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def preprocess_and_cache_datasets(config) -> dict:
@@ -583,6 +583,16 @@ def preprocess_and_cache_datasets(config) -> dict:
     decoder_tokenizer = AutoTokenizer.from_pretrained(config.gpt2_model)
     if decoder_tokenizer.pad_token is None:
         decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+
+    cache_store_text = bool(getattr(config, "cache_store_text", False))
+    cache_store_input_ids = bool(getattr(config, "cache_store_input_ids", False))
+    cache_store_attention_mask = bool(getattr(config, "cache_store_attention_mask", False))
+    cache_store_target_ids = bool(getattr(config, "cache_store_target_ids", True))
+    cache_store_target_attention_mask = bool(getattr(config, "cache_store_target_attention_mask", True))
+    cache_store_embeddings_fp16 = bool(getattr(config, "cache_store_embeddings_fp16", False))
+    cache_store_embeddings_int8 = bool(getattr(config, "cache_store_embeddings_int8", True))
+    cache_store_ideas_fp16 = bool(getattr(config, "cache_store_ideas_fp16", False))
+    cache_store_ideas_int8 = bool(getattr(config, "cache_store_ideas_int8", False))
 
     # Encoder for embeddings + idea vectors
     encoder = LatentEncoder(
@@ -687,42 +697,52 @@ def preprocess_and_cache_datasets(config) -> dict:
                     truncation=True,
                     return_tensors="pt"
                 )
-                target_enc = decoder_tokenizer(
-                    texts,
-                    max_length=config.max_target_len,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                )
+                target_enc = None
+                if cache_store_target_ids or cache_store_target_attention_mask:
+                    target_enc = decoder_tokenizer(
+                        texts,
+                        max_length=config.max_target_len,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt"
+                    )
 
                 input_ids = input_enc["input_ids"].to(device)
                 attention_mask = input_enc["attention_mask"].to(device)
 
-                with gpu_lock, torch.no_grad():
+                with gpu_lock, torch.inference_mode():
                     outputs = encoder.modernbert(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state
                     pooled = _mean_pooling(hidden_states, attention_mask)
-                    ideas = encoder.project_to_latent_sequence(pooled)
+                    ideas = None
+                    if cache_store_ideas_fp16 or cache_store_ideas_int8:
+                        ideas = encoder.project_to_latent_sequence(pooled)
 
                 for i in range(len(texts)):
-                    embedding_fp16 = _to_float16_list(pooled[i])
-                    idea_fp16 = _to_float16_list(ideas[i])
-                    embedding_q, embedding_scale = _quantize_int8(pooled[i])
-                    idea_q, idea_scale = _quantize_int8(ideas[i])
-                    row = {
-                        "text": texts[i],
-                        "input_ids": input_enc["input_ids"][i].tolist(),
-                        "attention_mask": input_enc["attention_mask"][i].tolist(),
-                        "target_ids": target_enc["input_ids"][i].tolist(),
-                        "target_attention_mask": target_enc["attention_mask"][i].tolist(),
-                        "embedding": embedding_fp16,
-                        "embedding_q": embedding_q,
-                        "embedding_scale": embedding_scale,
-                        "idea": idea_fp16,
-                        "idea_q": idea_q,
-                        "idea_scale": idea_scale
-                    }
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    row = {}
+                    if cache_store_text:
+                        row["text"] = texts[i]
+                    if cache_store_input_ids:
+                        row["input_ids"] = input_enc["input_ids"][i].tolist()
+                    if cache_store_attention_mask:
+                        row["attention_mask"] = input_enc["attention_mask"][i].tolist()
+                    if cache_store_target_ids and target_enc is not None:
+                        row["target_ids"] = target_enc["input_ids"][i].tolist()
+                    if cache_store_target_attention_mask and target_enc is not None:
+                        row["target_attention_mask"] = target_enc["attention_mask"][i].tolist()
+                    if cache_store_embeddings_fp16:
+                        row["embedding"] = _to_float16_list(pooled[i])
+                    if cache_store_embeddings_int8:
+                        embedding_q, embedding_scale = _quantize_int8(pooled[i])
+                        row["embedding_q"] = embedding_q
+                        row["embedding_scale"] = embedding_scale
+                    if cache_store_ideas_fp16 and ideas is not None:
+                        row["idea"] = _to_float16_list(ideas[i])
+                    if cache_store_ideas_int8 and ideas is not None:
+                        idea_q, idea_scale = _quantize_int8(ideas[i])
+                        row["idea_q"] = idea_q
+                        row["idea_scale"] = idea_scale
+                    f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 # advance progress by number of samples processed in this batch
                 _safe_update(task_id, advance=len(texts))
 
@@ -776,68 +796,78 @@ def preprocess_and_cache_datasets(config) -> dict:
                     return_tensors="pt"
                 )
 
-                source_target_enc = decoder_tokenizer(
-                    sources,
-                    max_length=config.max_target_len,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                target_target_enc = decoder_tokenizer(
-                    targets,
-                    max_length=config.max_target_len,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                )
+                source_target_enc = None
+                target_target_enc = None
+                if cache_store_target_ids or cache_store_target_attention_mask:
+                    source_target_enc = decoder_tokenizer(
+                        sources,
+                        max_length=config.max_target_len,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt"
+                    )
+                    target_target_enc = decoder_tokenizer(
+                        targets,
+                        max_length=config.max_target_len,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt"
+                    )
 
                 source_input_ids = source_enc["input_ids"].to(device)
                 source_attention = source_enc["attention_mask"].to(device)
                 target_input_ids = target_enc["input_ids"].to(device)
                 target_attention = target_enc["attention_mask"].to(device)
 
-                with gpu_lock, torch.no_grad():
+                with gpu_lock, torch.inference_mode():
                     source_outputs = encoder.modernbert(input_ids=source_input_ids, attention_mask=source_attention)
                     target_outputs = encoder.modernbert(input_ids=target_input_ids, attention_mask=target_attention)
                     source_pooled = _mean_pooling(source_outputs.last_hidden_state, source_attention)
                     target_pooled = _mean_pooling(target_outputs.last_hidden_state, target_attention)
-                    source_ideas = encoder.project_to_latent_sequence(source_pooled)
-                    target_ideas = encoder.project_to_latent_sequence(target_pooled)
+                    source_ideas = None
+                    target_ideas = None
+                    if cache_store_ideas_fp16 or cache_store_ideas_int8:
+                        source_ideas = encoder.project_to_latent_sequence(source_pooled)
+                        target_ideas = encoder.project_to_latent_sequence(target_pooled)
 
                 for i in range(len(sources)):
-                    source_embedding_fp16 = _to_float16_list(source_pooled[i])
-                    target_embedding_fp16 = _to_float16_list(target_pooled[i])
-                    source_idea_fp16 = _to_float16_list(source_ideas[i])
-                    target_idea_fp16 = _to_float16_list(target_ideas[i])
-                    source_embedding_q, source_embedding_scale = _quantize_int8(source_pooled[i])
-                    target_embedding_q, target_embedding_scale = _quantize_int8(target_pooled[i])
-                    source_idea_q, source_idea_scale = _quantize_int8(source_ideas[i])
-                    target_idea_q, target_idea_scale = _quantize_int8(target_ideas[i])
-                    row = {
-                        "source": sources[i],
-                        "target": targets[i],
-                        "source_input_ids": source_enc["input_ids"][i].tolist(),
-                        "source_attention_mask": source_enc["attention_mask"][i].tolist(),
-                        "source_target_ids": source_target_enc["input_ids"][i].tolist(),
-                        "source_target_attention_mask": source_target_enc["attention_mask"][i].tolist(),
-                        "target_input_ids": target_enc["input_ids"][i].tolist(),
-                        "target_attention_mask": target_enc["attention_mask"][i].tolist(),
-                        "target_target_ids": target_target_enc["input_ids"][i].tolist(),
-                        "target_target_attention_mask": target_target_enc["attention_mask"][i].tolist(),
-                        "source_embedding": source_embedding_fp16,
-                        "source_embedding_q": source_embedding_q,
-                        "source_embedding_scale": source_embedding_scale,
-                        "target_embedding": target_embedding_fp16,
-                        "target_embedding_q": target_embedding_q,
-                        "target_embedding_scale": target_embedding_scale,
-                        "source_idea": source_idea_fp16,
-                        "source_idea_q": source_idea_q,
-                        "source_idea_scale": source_idea_scale,
-                        "target_idea": target_idea_fp16,
-                        "target_idea_q": target_idea_q,
-                        "target_idea_scale": target_idea_scale
-                    }
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    row = {}
+                    if cache_store_text:
+                        row["source"] = sources[i]
+                        row["target"] = targets[i]
+                    if cache_store_input_ids:
+                        row["source_input_ids"] = source_enc["input_ids"][i].tolist()
+                        row["target_input_ids"] = target_enc["input_ids"][i].tolist()
+                    if cache_store_attention_mask:
+                        row["source_attention_mask"] = source_enc["attention_mask"][i].tolist()
+                        row["target_attention_mask"] = target_enc["attention_mask"][i].tolist()
+                    if cache_store_target_ids and source_target_enc is not None and target_target_enc is not None:
+                        row["source_target_ids"] = source_target_enc["input_ids"][i].tolist()
+                        row["target_target_ids"] = target_target_enc["input_ids"][i].tolist()
+                    if cache_store_target_attention_mask and source_target_enc is not None and target_target_enc is not None:
+                        row["source_target_attention_mask"] = source_target_enc["attention_mask"][i].tolist()
+                        row["target_target_attention_mask"] = target_target_enc["attention_mask"][i].tolist()
+                    if cache_store_embeddings_fp16:
+                        row["source_embedding"] = _to_float16_list(source_pooled[i])
+                        row["target_embedding"] = _to_float16_list(target_pooled[i])
+                    if cache_store_embeddings_int8:
+                        source_embedding_q, source_embedding_scale = _quantize_int8(source_pooled[i])
+                        target_embedding_q, target_embedding_scale = _quantize_int8(target_pooled[i])
+                        row["source_embedding_q"] = source_embedding_q
+                        row["source_embedding_scale"] = source_embedding_scale
+                        row["target_embedding_q"] = target_embedding_q
+                        row["target_embedding_scale"] = target_embedding_scale
+                    if cache_store_ideas_fp16 and source_ideas is not None and target_ideas is not None:
+                        row["source_idea"] = _to_float16_list(source_ideas[i])
+                        row["target_idea"] = _to_float16_list(target_ideas[i])
+                    if cache_store_ideas_int8 and source_ideas is not None and target_ideas is not None:
+                        source_idea_q, source_idea_scale = _quantize_int8(source_ideas[i])
+                        target_idea_q, target_idea_scale = _quantize_int8(target_ideas[i])
+                        row["source_idea_q"] = source_idea_q
+                        row["source_idea_scale"] = source_idea_scale
+                        row["target_idea_q"] = target_idea_q
+                        row["target_idea_scale"] = target_idea_scale
+                    f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 # advance by number of valid pairs processed
                 _safe_update(task_id, advance=len(sources))
 
@@ -1010,23 +1040,17 @@ def preprocess_and_cache_datasets(config) -> dict:
 class JsonlIndexedDataset(Dataset):
     """Memory-efficient JSONL reader using mmap with precomputed offsets."""
 
-    def __init__(self, jsonl_path: Path, max_samples: int | None = None):
+    def __init__(self, jsonl_path: Path, max_samples: int | None = None, use_index: bool = True):
         self.jsonl_path = jsonl_path
         self._offsets: list[int] = []
         self._lengths: list[int] = []
-        with jsonl_path.open("rb") as f:
-            while True:
-                offset = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                if line.strip():
-                    self._offsets.append(offset)
-                    self._lengths.append(len(line))
-                    if max_samples is not None and len(self._offsets) >= max_samples:
-                        break
         self._mmap = None
         self._fp = None
+        if use_index and self._load_index(max_samples):
+            return
+        self._build_index(max_samples)
+        if use_index:
+            self._save_index()
 
     def __len__(self) -> int:
         return len(self._offsets)
@@ -1042,6 +1066,61 @@ class JsonlIndexedDataset(Dataset):
         length = self._lengths[idx]
         line_bytes = self._mmap[offset: offset + length]
         return line_bytes.decode("utf-8")
+
+    def _index_path(self) -> Path:
+        return Path(str(self.jsonl_path) + ".idx.npz")
+
+    def _build_index(self, max_samples: int | None = None) -> None:
+        self._offsets = []
+        self._lengths = []
+        with self.jsonl_path.open("rb") as f:
+            while True:
+                offset = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self._offsets.append(offset)
+                    self._lengths.append(len(line))
+                    if max_samples is not None and len(self._offsets) >= max_samples:
+                        break
+
+    def _load_index(self, max_samples: int | None = None) -> bool:
+        index_path = self._index_path()
+        if not index_path.exists():
+            return False
+        try:
+            stat = self.jsonl_path.stat()
+            with np.load(index_path, allow_pickle=False) as data:
+                file_size = int(data.get("file_size", -1))
+                file_mtime = int(data.get("file_mtime", -1))
+                if file_size != stat.st_size or file_mtime != int(stat.st_mtime):
+                    return False
+                offsets = data["offsets"].astype(np.int64).tolist()
+                lengths = data["lengths"].astype(np.int32).tolist()
+            if max_samples is not None:
+                offsets = offsets[:max_samples]
+                lengths = lengths[:max_samples]
+            self._offsets = offsets
+            self._lengths = lengths
+            return True
+        except Exception:
+            return False
+
+    def _save_index(self) -> None:
+        try:
+            stat = self.jsonl_path.stat()
+            offsets = np.asarray(self._offsets, dtype=np.int64)
+            lengths = np.asarray(self._lengths, dtype=np.int32)
+            np.savez(
+                self._index_path(),
+                offsets=offsets,
+                lengths=lengths,
+                file_size=np.asarray(stat.st_size, dtype=np.int64),
+                file_mtime=np.asarray(int(stat.st_mtime), dtype=np.int64)
+            )
+        except Exception:
+            pass
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -1059,8 +1138,8 @@ class JsonlIndexedDataset(Dataset):
 
 
 class CachedIdeaDataset(JsonlIndexedDataset):
-    def __init__(self, jsonl_path: Path, max_samples: int | None = None):
-        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
+    def __init__(self, jsonl_path: Path, max_samples: int | None = None, use_index: bool = True):
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples, use_index=use_index)
 
     def __getitem__(self, idx: int) -> dict:
         line = self._read_line(idx)
@@ -1068,14 +1147,19 @@ class CachedIdeaDataset(JsonlIndexedDataset):
         if "idea_q" in sample and "idea_scale" in sample:
             idea = _dequantize_int8(sample["idea_q"], sample["idea_scale"])
             return {"idea": torch.tensor(idea, dtype=torch.float16)}
-        return {
-            "idea": torch.tensor(sample["idea"], dtype=torch.float16)
-        }
+        if "idea" in sample:
+            return {"idea": torch.tensor(sample["idea"], dtype=torch.float16)}
+        if "embedding_q" in sample and "embedding_scale" in sample:
+            emb = _dequantize_int8(sample["embedding_q"], sample["embedding_scale"])
+            return {"embedding": torch.tensor(emb, dtype=torch.float16)}
+        if "embedding" in sample:
+            return {"embedding": torch.tensor(sample["embedding"], dtype=torch.float16)}
+        raise KeyError("Missing idea/embedding fields in cached sample")
 
 
 class CachedAdapterDataset(JsonlIndexedDataset):
-    def __init__(self, jsonl_path: Path, idea_key: str, target_ids_key: str, target_mask_key: str, max_samples: int | None = None):
-        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
+    def __init__(self, jsonl_path: Path, idea_key: str, target_ids_key: str, target_mask_key: str, max_samples: int | None = None, use_index: bool = True):
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples, use_index=use_index)
         self.idea_key = idea_key
         self.target_ids_key = target_ids_key
         self.target_mask_key = target_mask_key
@@ -1086,18 +1170,38 @@ class CachedAdapterDataset(JsonlIndexedDataset):
         if f"{self.idea_key}_q" in sample and f"{self.idea_key}_scale" in sample:
             idea = _dequantize_int8(sample[f"{self.idea_key}_q"], sample[f"{self.idea_key}_scale"])
             idea_tensor = torch.tensor(idea, dtype=torch.float16)
-        else:
+            return {
+                "idea": idea_tensor,
+                "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
+                "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
+            }
+        if self.idea_key in sample:
             idea_tensor = torch.tensor(sample[self.idea_key], dtype=torch.float16)
-        return {
-            "idea": idea_tensor,
-            "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
-            "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
-        }
+            return {
+                "idea": idea_tensor,
+                "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
+                "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
+            }
+        embedding_key = self.idea_key.replace("idea", "embedding")
+        if f"{embedding_key}_q" in sample and f"{embedding_key}_scale" in sample:
+            emb = _dequantize_int8(sample[f"{embedding_key}_q"], sample[f"{embedding_key}_scale"])
+            return {
+                "embedding": torch.tensor(emb, dtype=torch.float16),
+                "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
+                "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
+            }
+        if embedding_key in sample:
+            return {
+                "embedding": torch.tensor(sample[embedding_key], dtype=torch.float16),
+                "target_ids": torch.tensor(sample[self.target_ids_key], dtype=torch.long),
+                "target_attention_mask": torch.tensor(sample[self.target_mask_key], dtype=torch.long)
+            }
+        raise KeyError("Missing idea/embedding fields in cached sample")
 
 
 class CachedSciTLDRPairs(JsonlIndexedDataset):
-    def __init__(self, jsonl_path: Path, max_samples: int | None = None):
-        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
+    def __init__(self, jsonl_path: Path, max_samples: int | None = None, use_index: bool = True):
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples, use_index=use_index)
 
     def __getitem__(self, idx: int) -> dict:
         line = self._read_line(idx)
@@ -1105,13 +1209,23 @@ class CachedSciTLDRPairs(JsonlIndexedDataset):
         if "source_idea_q" in sample and "source_idea_scale" in sample:
             source_idea = _dequantize_int8(sample["source_idea_q"], sample["source_idea_scale"])
             source_idea_tensor = torch.tensor(source_idea, dtype=torch.float16)
-        else:
+        elif "source_idea" in sample:
             source_idea_tensor = torch.tensor(sample["source_idea"], dtype=torch.float16)
+        elif "source_embedding_q" in sample and "source_embedding_scale" in sample:
+            source_emb = _dequantize_int8(sample["source_embedding_q"], sample["source_embedding_scale"])
+            source_idea_tensor = torch.tensor(source_emb, dtype=torch.float16)
+        else:
+            source_idea_tensor = torch.tensor(sample["source_embedding"], dtype=torch.float16)
         if "target_idea_q" in sample and "target_idea_scale" in sample:
             target_idea = _dequantize_int8(sample["target_idea_q"], sample["target_idea_scale"])
             target_idea_tensor = torch.tensor(target_idea, dtype=torch.float16)
-        else:
+        elif "target_idea" in sample:
             target_idea_tensor = torch.tensor(sample["target_idea"], dtype=torch.float16)
+        elif "target_embedding_q" in sample and "target_embedding_scale" in sample:
+            target_emb = _dequantize_int8(sample["target_embedding_q"], sample["target_embedding_scale"])
+            target_idea_tensor = torch.tensor(target_emb, dtype=torch.float16)
+        else:
+            target_idea_tensor = torch.tensor(sample["target_embedding"], dtype=torch.float16)
         return {
             "source_idea": source_idea_tensor,
             "target_idea": target_idea_tensor,
@@ -1121,44 +1235,58 @@ class CachedSciTLDRPairs(JsonlIndexedDataset):
 
 
 def collate_cached_ideas(batch: list, model = None, config = None) -> dict:
-    ideas = torch.stack([item["idea"] for item in batch])
-    ideas = ideas.to(dtype=torch.float16)
-    
-    # Append STOP_LATENT if model is provided and use_stop_latent is enabled
-    if model is not None and getattr(config, "use_stop_latent", True):
-        stop_latent = model.get_stop_latent(device=ideas.device)
-        stop_latent = stop_latent.to(dtype=torch.float16)
-        ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
-    
-    return {"idea": ideas}
+    if "idea" in batch[0]:
+        ideas = torch.stack([item["idea"] for item in batch])
+        ideas = ideas.to(dtype=torch.float16)
+
+        # Append STOP_LATENT if model is provided and use_stop_latent is enabled
+        if model is not None and getattr(config, "use_stop_latent", True):
+            stop_latent = model.get_stop_latent(device=ideas.device)
+            stop_latent = stop_latent.to(dtype=torch.float16)
+            ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
+
+        return {"idea": ideas}
+
+    embeddings = torch.stack([item["embedding"] for item in batch])
+    embeddings = embeddings.to(dtype=torch.float16)
+    return {"embedding": embeddings}
 
 
 def collate_cached_adapter(batch: list, model = None, config = None) -> dict:
-    ideas = torch.stack([item["idea"] for item in batch])
-    ideas = ideas.to(dtype=torch.float16)
     target_ids = torch.stack([item["target_ids"] for item in batch])
     target_attention_mask = torch.stack([item["target_attention_mask"] for item in batch])
-    
-    # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
-    if model is not None and getattr(config, "use_stop_latent", True):
-        batch_size = ideas.size(0)
-        stop_latent = model.get_stop_latent(device=ideas.device)
-        stop_latent = stop_latent.to(dtype=torch.float16)
-        eos_token_id = model.gpt2.config.eos_token_id
-        
-        # Append STOP_LATENT to ideas (1 sample for STOP_LATENT)
-        ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
-        
-        # Create target for STOP_LATENT sample: sequence of all EOS tokens
-        eos_target = torch.full((1, target_ids.size(1)), fill_value=eos_token_id, dtype=target_ids.dtype, device=target_ids.device)
-        target_ids = torch.cat([target_ids, eos_target], dim=0)
-        
-        # Create attention for STOP_LATENT sample: all ones (all valid)
-        eos_attention = torch.ones((1, target_attention_mask.size(1)), dtype=target_attention_mask.dtype, device=target_attention_mask.device)
-        target_attention_mask = torch.cat([target_attention_mask, eos_attention], dim=0)
-    
+
+    if "idea" in batch[0]:
+        ideas = torch.stack([item["idea"] for item in batch])
+        ideas = ideas.to(dtype=torch.float16)
+
+        # Append STOP_LATENT and EOS if model is provided and use_stop_latent is enabled
+        if model is not None and getattr(config, "use_stop_latent", True):
+            stop_latent = model.get_stop_latent(device=ideas.device)
+            stop_latent = stop_latent.to(dtype=torch.float16)
+            eos_token_id = model.gpt2.config.eos_token_id
+
+            # Append STOP_LATENT to ideas (1 sample for STOP_LATENT)
+            ideas = torch.cat([ideas, stop_latent.unsqueeze(0)], dim=0)
+
+            # Create target for STOP_LATENT sample: sequence of all EOS tokens
+            eos_target = torch.full((1, target_ids.size(1)), fill_value=eos_token_id, dtype=target_ids.dtype, device=target_ids.device)
+            target_ids = torch.cat([target_ids, eos_target], dim=0)
+
+            # Create attention for STOP_LATENT sample: all ones (all valid)
+            eos_attention = torch.ones((1, target_attention_mask.size(1)), dtype=target_attention_mask.dtype, device=target_attention_mask.device)
+            target_attention_mask = torch.cat([target_attention_mask, eos_attention], dim=0)
+
+        return {
+            "idea": ideas,
+            "target_ids": target_ids,
+            "target_attention_mask": target_attention_mask
+        }
+
+    embeddings = torch.stack([item["embedding"] for item in batch])
+    embeddings = embeddings.to(dtype=torch.float16)
     return {
-        "idea": ideas,
+        "embedding": embeddings,
         "target_ids": target_ids,
         "target_attention_mask": target_attention_mask
     }
@@ -1200,22 +1328,24 @@ def collate_cached_pairs(batch: list, model = None, config = None) -> dict:
 
 def create_pretrain_middle_dataloaders(config, cache_paths: dict, model = None) -> DataLoader:
     stage_max = getattr(config, "pretrain_middle_max_samples", None)
+    use_index = bool(getattr(config, "cache_write_offsets_index", True))
     def _cap(name: str):
         return getattr(config, f"pretrain_middle_max_samples_{name}", None) or stage_max
     datasets = []
     if cache_paths["wikitext_train"].exists():
-        datasets.append(CachedIdeaDataset(cache_paths["wikitext_train"], max_samples=_cap("wikitext")))
+        datasets.append(CachedIdeaDataset(cache_paths["wikitext_train"], max_samples=_cap("wikitext"), use_index=use_index))
     if cache_paths["arxiv_train"].exists():
-        datasets.append(CachedIdeaDataset(cache_paths["arxiv_train"], max_samples=_cap("arxiv")))
+        datasets.append(CachedIdeaDataset(cache_paths["arxiv_train"], max_samples=_cap("arxiv"), use_index=use_index))
     if cache_paths["english_pretrain_train"].exists():
-        datasets.append(CachedIdeaDataset(cache_paths["english_pretrain_train"], max_samples=_cap("english")))
+        datasets.append(CachedIdeaDataset(cache_paths["english_pretrain_train"], max_samples=_cap("english"), use_index=use_index))
     if cache_paths["scitldr_train"].exists():
         scitldr = CachedAdapterDataset(
             cache_paths["scitldr_train"],
             idea_key="source_idea",
             target_ids_key="source_target_ids",
             target_mask_key="source_target_attention_mask",
-            max_samples=_cap("scitldr")
+            max_samples=_cap("scitldr"),
+            use_index=use_index
         )
         datasets.append(scitldr)
     combined = ConcatDataset(datasets)
@@ -1235,17 +1365,18 @@ def create_pretrain_middle_dataloaders(config, cache_paths: dict, model = None) 
 
 def create_pretrain_adapter_dataloader(config, cache_paths: dict, model = None) -> DataLoader:
     stage_max = getattr(config, "pretrain_adapter_max_samples", None)
+    use_index = bool(getattr(config, "cache_write_offsets_index", True))
     def _cap(name: str):
         return getattr(config, f"pretrain_adapter_max_samples_{name}", None) or stage_max
     datasets = []
     if cache_paths["wikitext_train"].exists():
-        datasets.append(CachedAdapterDataset(cache_paths["wikitext_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("wikitext")))
+        datasets.append(CachedAdapterDataset(cache_paths["wikitext_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("wikitext"), use_index=use_index))
     if cache_paths["arxiv_train"].exists():
-        datasets.append(CachedAdapterDataset(cache_paths["arxiv_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("arxiv")))
+        datasets.append(CachedAdapterDataset(cache_paths["arxiv_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("arxiv"), use_index=use_index))
     if cache_paths["english_pretrain_train"].exists():
-        datasets.append(CachedAdapterDataset(cache_paths["english_pretrain_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("english")))
+        datasets.append(CachedAdapterDataset(cache_paths["english_pretrain_train"], "idea", "target_ids", "target_attention_mask", max_samples=_cap("english"), use_index=use_index))
     if cache_paths["scitldr_train"].exists():
-        datasets.append(CachedAdapterDataset(cache_paths["scitldr_train"], "source_idea", "source_target_ids", "source_target_attention_mask", max_samples=_cap("scitldr")))
+        datasets.append(CachedAdapterDataset(cache_paths["scitldr_train"], "source_idea", "source_target_ids", "source_target_attention_mask", max_samples=_cap("scitldr"), use_index=use_index))
     combined = ConcatDataset(datasets)
     
     # Create collate function with model and config

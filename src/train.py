@@ -638,9 +638,15 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
 
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
-        z_in = batch[target_key].to(device, dtype=_latent_dtype(config, device))
-        z_target = z_in
         with _maybe_autocast(config, device):
+            if target_key in batch:
+                z_in = batch[target_key].to(device, dtype=_latent_dtype(config, device))
+            elif "embedding" in batch:
+                embeddings = batch["embedding"].to(device, dtype=_latent_dtype(config, device))
+                z_in = model.encoder.project_to_latent_sequence(embeddings)
+            else:
+                raise KeyError("Batch missing idea or embedding fields")
+            z_target = z_in
             z_out = model.middle_model(z_in)
             loss = compute_latent_loss(z_out, z_target, config)
             loss = loss / config.gradient_accumulation_steps
@@ -719,7 +725,13 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
             target_ids = batch["summary_ids"].to(device)
             target_attention = batch["summary_attention_mask"].to(device)
         else:
-            z_in = batch["idea"].to(device, dtype=_latent_dtype(config, device))
+            if "idea" in batch:
+                z_in = batch["idea"].to(device, dtype=_latent_dtype(config, device))
+            elif "embedding" in batch:
+                embeddings = batch["embedding"].to(device, dtype=_latent_dtype(config, device))
+                z_in = model.encoder.project_to_latent_sequence(embeddings)
+            else:
+                raise KeyError("Batch missing idea or embedding fields")
             target_ids = batch["target_ids"].to(device)
             target_attention = batch["target_attention_mask"].to(device)
 
