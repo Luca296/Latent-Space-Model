@@ -7,6 +7,7 @@ Handles SAMSum dataset loading, tokenization, and batching.
 import json
 import os
 import threading
+import mmap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
@@ -198,6 +199,18 @@ def collate_fn(batch: list) -> dict:
     }
 
 
+def _dataloader_kwargs(config, num_workers_override: int | None = None) -> dict:
+    num_workers = config.num_workers if num_workers_override is None else num_workers_override
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": True if torch.cuda.is_available() else False
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = getattr(config, "prefetch_factor", 2)
+    return kwargs
+
+
 def create_dataloaders(
     config,
     train_samples: int = None,
@@ -241,8 +254,7 @@ def create_dataloaders(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
     
     val_loader = DataLoader(
@@ -250,8 +262,7 @@ def create_dataloaders(
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
     
     return train_loader, val_loader
@@ -283,8 +294,7 @@ def create_test_dataloader(config, test_samples: int = None) -> DataLoader:
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
     
     return test_loader
@@ -425,8 +435,7 @@ def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
     
     val_loader = DataLoader(
@@ -434,8 +443,7 @@ def create_identity_dataloaders(config) -> tuple[DataLoader, DataLoader]:
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
     
     return train_loader, val_loader
@@ -475,8 +483,7 @@ def create_phase1_dataloaders(
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
 
     val_loader = DataLoader(
@@ -484,8 +491,7 @@ def create_phase1_dataloaders(
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
 
     return train_loader, val_loader
@@ -1001,11 +1007,14 @@ def preprocess_and_cache_datasets(config) -> dict:
     return cache_paths
 
 
-class CachedIdeaDataset(Dataset):
+class JsonlIndexedDataset(Dataset):
+    """Memory-efficient JSONL reader using mmap with precomputed offsets."""
+
     def __init__(self, jsonl_path: Path, max_samples: int | None = None):
         self.jsonl_path = jsonl_path
-        self._offsets = []
-        with jsonl_path.open("r", encoding="utf-8") as f:
+        self._offsets: list[int] = []
+        self._lengths: list[int] = []
+        with jsonl_path.open("rb") as f:
             while True:
                 offset = f.tell()
                 line = f.readline()
@@ -1013,16 +1022,48 @@ class CachedIdeaDataset(Dataset):
                     break
                 if line.strip():
                     self._offsets.append(offset)
+                    self._lengths.append(len(line))
                     if max_samples is not None and len(self._offsets) >= max_samples:
                         break
+        self._mmap = None
+        self._fp = None
 
     def __len__(self) -> int:
         return len(self._offsets)
 
+    def _ensure_mmap(self) -> None:
+        if self._mmap is None:
+            self._fp = self.jsonl_path.open("rb")
+            self._mmap = mmap.mmap(self._fp.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def _read_line(self, idx: int) -> str:
+        self._ensure_mmap()
+        offset = self._offsets[idx]
+        length = self._lengths[idx]
+        line_bytes = self._mmap[offset: offset + length]
+        return line_bytes.decode("utf-8")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_mmap"] = None
+        state["_fp"] = None
+        return state
+
+    def __del__(self):
+        try:
+            if self._mmap is not None:
+                self._mmap.close()
+        finally:
+            if self._fp is not None:
+                self._fp.close()
+
+
+class CachedIdeaDataset(JsonlIndexedDataset):
+    def __init__(self, jsonl_path: Path, max_samples: int | None = None):
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
+
     def __getitem__(self, idx: int) -> dict:
-        with self.jsonl_path.open("r", encoding="utf-8") as f:
-            f.seek(self._offsets[idx])
-            line = f.readline()
+        line = self._read_line(idx)
         sample = json.loads(line)
         if "idea_q" in sample and "idea_scale" in sample:
             idea = _dequantize_int8(sample["idea_q"], sample["idea_scale"])
@@ -1032,31 +1073,15 @@ class CachedIdeaDataset(Dataset):
         }
 
 
-class CachedAdapterDataset(Dataset):
+class CachedAdapterDataset(JsonlIndexedDataset):
     def __init__(self, jsonl_path: Path, idea_key: str, target_ids_key: str, target_mask_key: str, max_samples: int | None = None):
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
         self.idea_key = idea_key
         self.target_ids_key = target_ids_key
         self.target_mask_key = target_mask_key
-        self.jsonl_path = jsonl_path
-        self._offsets = []
-        with jsonl_path.open("r", encoding="utf-8") as f:
-            while True:
-                offset = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                if line.strip():
-                    self._offsets.append(offset)
-                    if max_samples is not None and len(self._offsets) >= max_samples:
-                        break
-
-    def __len__(self) -> int:
-        return len(self._offsets)
 
     def __getitem__(self, idx: int) -> dict:
-        with self.jsonl_path.open("r", encoding="utf-8") as f:
-            f.seek(self._offsets[idx])
-            line = f.readline()
+        line = self._read_line(idx)
         sample = json.loads(line)
         if f"{self.idea_key}_q" in sample and f"{self.idea_key}_scale" in sample:
             idea = _dequantize_int8(sample[f"{self.idea_key}_q"], sample[f"{self.idea_key}_scale"])
@@ -1070,28 +1095,12 @@ class CachedAdapterDataset(Dataset):
         }
 
 
-class CachedSciTLDRPairs(Dataset):
+class CachedSciTLDRPairs(JsonlIndexedDataset):
     def __init__(self, jsonl_path: Path, max_samples: int | None = None):
-        self.jsonl_path = jsonl_path
-        self._offsets = []
-        with jsonl_path.open("r", encoding="utf-8") as f:
-            while True:
-                offset = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                if line.strip():
-                    self._offsets.append(offset)
-                    if max_samples is not None and len(self._offsets) >= max_samples:
-                        break
-
-    def __len__(self) -> int:
-        return len(self._offsets)
+        super().__init__(jsonl_path=jsonl_path, max_samples=max_samples)
 
     def __getitem__(self, idx: int) -> dict:
-        with self.jsonl_path.open("r", encoding="utf-8") as f:
-            f.seek(self._offsets[idx])
-            line = f.readline()
+        line = self._read_line(idx)
         sample = json.loads(line)
         if "source_idea_q" in sample and "source_idea_scale" in sample:
             source_idea = _dequantize_int8(sample["source_idea_q"], sample["source_idea_scale"])
@@ -1220,8 +1229,7 @@ def create_pretrain_middle_dataloaders(config, cache_paths: dict, model = None) 
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_partial,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
 
 
@@ -1249,8 +1257,7 @@ def create_pretrain_adapter_dataloader(config, cache_paths: dict, model = None) 
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_partial,
-        num_workers=config.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config)
     )
 
 
@@ -1285,7 +1292,9 @@ class SAMSumIdeaDataset(Dataset):
             model_name=config.modernbert_model,
             hidden_dim=config.modernbert_hidden_dim,
             latent_dim=config.latent_dim,
-            num_unfrozen_layers=0
+            num_unfrozen_layers=0,
+            attn_implementation=getattr(config, "attn_implementation", None),
+            use_gradient_checkpointing=getattr(config, "use_gradient_checkpointing", False)
         ).to(self.device)
         self.encoder.eval()
         for param in self.encoder.parameters():
@@ -1385,8 +1394,7 @@ def create_finetune_middle_dataloader(config, cache_paths: dict = None, model = 
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_partial,
-        num_workers=0,  # Disable num_workers for on-the-fly idea computation
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config, num_workers_override=0)
     )
 
 
@@ -1409,8 +1417,7 @@ def create_finetune_adapter_dataloader(config, cache_paths: dict = None, model =
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_partial,
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config, num_workers_override=0)
     )
 
 
@@ -1439,15 +1446,13 @@ def create_finetune_adapter_dataloaders(config, cache_paths: dict = None, model 
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_partial,
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config, num_workers_override=0)
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn_partial,
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
+        **_dataloader_kwargs(config, num_workers_override=0)
     )
     return train_loader, val_loader

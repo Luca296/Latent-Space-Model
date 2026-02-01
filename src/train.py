@@ -8,15 +8,17 @@ Supports both Rich TUI and simple Tqdm output.
 import os
 import argparse
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 import glob
+from concurrent.futures import ThreadPoolExecutor
 
 # Rich imports
 from rich.console import Console
@@ -54,6 +56,66 @@ from src.data import (
 
 # Decoder pad token ID (use PyTorch's default ignore index)
 DECODER_PAD_TOKEN_ID = -100
+
+_checkpoint_executor = ThreadPoolExecutor(max_workers=1)
+
+
+def _get_amp_dtype(config: Config, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda":
+        return None
+    if getattr(config, "use_bf16", False) and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if getattr(config, "use_fp16", False):
+        return torch.float16
+    return None
+
+
+def _maybe_autocast(config: Config, device: torch.device):
+    amp_dtype = _get_amp_dtype(config, device)
+    return autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
+
+
+def _latent_dtype(config: Config, device: torch.device) -> torch.dtype:
+    amp_dtype = _get_amp_dtype(config, device)
+    return amp_dtype if amp_dtype is not None else torch.float32
+
+
+def _num_optim_steps(dataloader, epochs: int, config: Config) -> int:
+    if dataloader is None:
+        return 0
+    total_steps = len(dataloader) * epochs
+    return max(1, math.ceil(total_steps / config.gradient_accumulation_steps))
+
+
+def create_scheduler(optimizer, num_training_steps: int, warmup_steps: int):
+    if num_training_steps <= 0:
+        return None
+    warmup_steps = min(warmup_steps, num_training_steps)
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _maybe_compile_model(model: LatentSpaceModel, config: Config) -> LatentSpaceModel:
+    if not getattr(config, "use_torch_compile", False):
+        return model
+    if not hasattr(torch, "compile"):
+        return model
+    mode = getattr(config, "torch_compile_mode", "reduce-overhead")
+    try:
+        model.middle_model = torch.compile(model.middle_model, mode=mode)
+    except Exception:
+        pass
+    try:
+        model.prefix_adapter = torch.compile(model.prefix_adapter, mode=mode)
+    except Exception:
+        pass
+    return model
 
 
 def append_stop_latent_to_latent_batch(
@@ -135,20 +197,33 @@ def save_checkpoint(
     scaler: GradScaler,
     step: int,
     epoch: int,
-    config: Config
+    config: Config,
+    scheduler=None
 ):
     """Save model checkpoint."""
     checkpoint_dir = Path(config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
-    torch.save({
+    payload = {
         "step": step,
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "config": config
-    }, checkpoint_path, _use_new_zipfile_serialization=False)
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+
+    if getattr(config, "async_checkpointing", False):
+        _checkpoint_executor.submit(
+            torch.save,
+            payload,
+            checkpoint_path,
+            _use_new_zipfile_serialization=False
+        )
+    else:
+        torch.save(payload, checkpoint_path, _use_new_zipfile_serialization=False)
 
 
 def cleanup_checkpoints(config: Config, best_model_saved: bool):
@@ -183,7 +258,7 @@ def find_latest_checkpoint(config: Config):
     return latest_path
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, scaler, device, config):
+def load_checkpoint(checkpoint_path, model, optimizer, scaler, device, config, scheduler=None):
     """Load a checkpoint and return the starting epoch and step."""
     print(f"Loading checkpoint from {checkpoint_path}...")
     # Use weights_only=False to allow loading the Config object
@@ -205,6 +280,13 @@ def load_checkpoint(checkpoint_path, model, optimizer, scaler, device, config):
             print("  - Scaler state loaded")
         except Exception as e:
             print(f"  - Warning: Could not load scaler state: {e}")
+
+    if "scheduler_state_dict" in checkpoint and scheduler is not None:
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            print("  - Scheduler state loaded")
+        except Exception as e:
+            print(f"  - Warning: Could not load scheduler state: {e}")
     
     # Get the step and epoch to resume from
     start_step = checkpoint.get("step", 0)
@@ -313,7 +395,7 @@ class TrainingDashboard:
         self.current_step = step
 
 
-def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch, dashboard, start_step=0):
+def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch, dashboard, start_step=0, scheduler=None):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -332,7 +414,7 @@ def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch,
         target_ids = batch["target_ids"].to(device)
         target_attention_mask = batch["target_attention_mask"].to(device)
         
-        with autocast(enabled=config.use_fp16):
+        with _maybe_autocast(config, device):
             logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
             loss = compute_loss(logits, target_ids, target_attention_mask)
             loss = loss / config.gradient_accumulation_steps
@@ -344,13 +426,15 @@ def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch,
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             global_step = epoch * len(dataloader) + step + 1
             avg_loss = total_loss / num_batches
             dashboard.update_metrics(loss.item() * config.gradient_accumulation_steps, avg_loss, global_step)
             
             if global_step % config.save_every == 0:
-                save_checkpoint(model, optimizer, scaler, global_step, epoch, config)
+                save_checkpoint(model, optimizer, scaler, global_step, epoch, config, scheduler=scheduler)
                 dashboard.log(f"[yellow]Checkpoint saved at step {global_step}[/]")
         
         dashboard.progress_group.advance(dashboard.batch_task)
@@ -358,6 +442,8 @@ def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch,
     if num_batches % config.gradient_accumulation_steps != 0:
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
         
     return total_loss / num_batches
@@ -376,7 +462,7 @@ def validate_tui(model, dataloader, device, config, dashboard):
             target_ids = batch["target_ids"].to(device)
             target_attention_mask = batch["target_attention_mask"].to(device)
             
-            with autocast(enabled=config.use_fp16):
+            with _maybe_autocast(config, device):
                 logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
                 loss = compute_loss(logits, target_ids, target_attention_mask)
             
@@ -387,7 +473,7 @@ def validate_tui(model, dataloader, device, config, dashboard):
     dashboard.progress_group.remove_task(val_task)
     return total_loss / num_batches
 
-def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0) -> bool:
+def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0, scheduler=None) -> bool:
     dashboard = TrainingDashboard(config)
     best_model_saved = False
     # Ensure epoch progress bar matches total epochs
@@ -404,7 +490,7 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
         update_view()
         
         for epoch in range(start_epoch, config.num_epochs):
-            train_loss = train_epoch_tui(model, train_loader, optimizer, scaler, device, config, epoch, dashboard, start_step if epoch == start_epoch else 0)
+            train_loss = train_epoch_tui(model, train_loader, optimizer, scaler, device, config, epoch, dashboard, start_step if epoch == start_epoch else 0, scheduler=scheduler)
             dashboard.log(f"Epoch {epoch+1} Train Loss: {train_loss:.4f}")
             
             val_loss = validate_tui(model, val_loader, device, config, dashboard)
@@ -437,7 +523,7 @@ def run_tui_training(config, model, train_loader, val_loader, optimizer, scaler,
 
 # --- Simple (No-TUI) Logic ---
 
-def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epoch, start_step=0):
+def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epoch, start_step=0, scheduler=None):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -455,7 +541,7 @@ def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epo
         target_ids = batch["target_ids"].to(device)
         target_attention_mask = batch["target_attention_mask"].to(device)
         
-        with autocast(enabled=config.use_fp16):
+        with _maybe_autocast(config, device):
             logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
             loss = compute_loss(logits, target_ids, target_attention_mask)
             loss = loss / config.gradient_accumulation_steps
@@ -467,16 +553,20 @@ def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epo
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             progress_bar.set_postfix({"loss": total_loss / num_batches})
             
             global_step = epoch * len(dataloader) + step + 1
             if global_step % config.save_every == 0:
-                save_checkpoint(model, optimizer, scaler, global_step, epoch, config)
+                save_checkpoint(model, optimizer, scaler, global_step, epoch, config, scheduler=scheduler)
                 
     if num_batches % config.gradient_accumulation_steps != 0:
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
         
     return total_loss / num_batches
@@ -492,7 +582,7 @@ def validate_simple(model, dataloader, device, config):
             target_ids = batch["target_ids"].to(device)
             target_attention_mask = batch["target_attention_mask"].to(device)
             
-            with autocast(enabled=config.use_fp16):
+            with _maybe_autocast(config, device):
                 logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
                 loss = compute_loss(logits, target_ids, target_attention_mask)
             
@@ -500,7 +590,7 @@ def validate_simple(model, dataloader, device, config):
             num_batches += 1
     return total_loss / num_batches
 
-def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0) -> bool:
+def run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch=0, start_step=0, scheduler=None) -> bool:
     print("Starting training (Simple Mode)...")
     if start_epoch > 0 or start_step > 0:
         print(f"Resuming from epoch {start_epoch}, step {start_step}...")
@@ -508,7 +598,7 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
     best_model_saved = False
     
     for epoch in range(start_epoch, config.num_epochs):
-        train_loss = train_epoch_simple(model, train_loader, optimizer, scaler, device, config, epoch, start_step if epoch == start_epoch else 0)
+        train_loss = train_epoch_simple(model, train_loader, optimizer, scaler, device, config, epoch, start_step if epoch == start_epoch else 0, scheduler=scheduler)
         print(f"Epoch {epoch+1}/{config.num_epochs} - Train Loss: {train_loss:.4f}")
         
         val_loss = validate_simple(model, val_loader, device, config)
@@ -536,7 +626,7 @@ def run_simple_training(config, model, train_loader, val_loader, optimizer, scal
 
 # --- Two-Stage Scientific Pipeline ---
 
-def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epoch, target_key: str = "idea"):
+def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epoch, target_key: str = "idea", scheduler=None):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -544,9 +634,9 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
 
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
-        z_in = batch[target_key].to(device, dtype=torch.float16)
+        z_in = batch[target_key].to(device, dtype=_latent_dtype(config, device))
         z_target = z_in
-        with autocast(enabled=config.use_fp16):
+        with _maybe_autocast(config, device):
             z_out = model.middle_model(z_in)
             loss = compute_latent_loss(z_out, z_target, config)
             loss = loss / config.gradient_accumulation_steps
@@ -558,18 +648,22 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             progress_bar.set_postfix({"loss": total_loss / num_batches})
 
     if num_batches % config.gradient_accumulation_steps != 0:
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
 
     return total_loss / max(1, num_batches)
 
 
-def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, config, epoch):
+def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, config, epoch, scheduler=None):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -577,11 +671,11 @@ def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, co
 
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
-        source_idea = batch["source_idea"].to(device, dtype=torch.float16)
-        target_idea = batch["target_idea"].to(device, dtype=torch.float16)
+        source_idea = batch["source_idea"].to(device, dtype=_latent_dtype(config, device))
+        target_idea = batch["target_idea"].to(device, dtype=_latent_dtype(config, device))
         source_idea, target_idea = append_stop_latent_to_latent_batch(source_idea, target_idea, model)
 
-        with autocast(enabled=config.use_fp16):
+        with _maybe_autocast(config, device):
             z_out = model.middle_model(source_idea)
             loss = compute_latent_loss(z_out, target_idea, config)
             loss = loss / config.gradient_accumulation_steps
@@ -593,18 +687,22 @@ def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, co
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             progress_bar.set_postfix({"loss": total_loss / num_batches})
 
     if num_batches % config.gradient_accumulation_steps != 0:
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
 
     return total_loss / max(1, num_batches)
 
 
-def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, epoch, use_middle: bool, is_summary: bool = False, use_stop_latent: bool = False):
+def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, epoch, use_middle: bool, is_summary: bool = False, use_stop_latent: bool = False, scheduler=None):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -613,11 +711,11 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
     optimizer.zero_grad()
     for step, batch in enumerate(progress_bar):
         if is_summary:
-            z_in = batch["source_idea"].to(device, dtype=torch.float16)
+            z_in = batch["source_idea"].to(device, dtype=_latent_dtype(config, device))
             target_ids = batch["summary_ids"].to(device)
             target_attention = batch["summary_attention_mask"].to(device)
         else:
-            z_in = batch["idea"].to(device, dtype=torch.float16)
+            z_in = batch["idea"].to(device, dtype=_latent_dtype(config, device))
             target_ids = batch["target_ids"].to(device)
             target_attention = batch["target_attention_mask"].to(device)
 
@@ -629,7 +727,7 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
                 model
             )
 
-        with autocast(enabled=config.use_fp16):
+        with _maybe_autocast(config, device):
             logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
             loss = compute_loss(logits, target_ids, target_attention)
             loss = loss / config.gradient_accumulation_steps
@@ -641,12 +739,16 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
         if (step + 1) % config.gradient_accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             progress_bar.set_postfix({"loss": total_loss / num_batches})
 
     if num_batches % config.gradient_accumulation_steps != 0:
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
 
     return total_loss / max(1, num_batches)
@@ -658,10 +760,10 @@ def validate_adapter_epoch(model, dataloader, device, config, use_middle: bool) 
     num_batches = 0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating (Summary)"):
-            z_in = batch["source_idea"].to(device)
+            z_in = batch["source_idea"].to(device, dtype=_latent_dtype(config, device))
             target_ids = batch["summary_ids"].to(device)
             target_attention = batch["summary_attention_mask"].to(device)
-            with autocast(enabled=config.use_fp16):
+            with _maybe_autocast(config, device):
                 logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
                 loss = compute_loss(logits, target_ids, target_attention)
             total_loss += loss.item()
@@ -703,6 +805,7 @@ def train(config: Config):
 
         print("Initializing model for two-stage pipeline...")
         model = LatentSpaceModel(config).to(device)
+        model = _maybe_compile_model(model, config)
 
         if cache_paths.get("compression_mlp") and Path(cache_paths["compression_mlp"]).exists():
             model.encoder.compression_mlp.load_state_dict(torch.load(cache_paths["compression_mlp"], map_location=device, weights_only=False))
@@ -712,7 +815,8 @@ def train(config: Config):
             for param in model.encoder.compression_mlp.parameters():
                 param.requires_grad = False
 
-        scaler = GradScaler(enabled=config.use_fp16)
+        amp_dtype = _get_amp_dtype(config, device)
+        scaler = GradScaler(enabled=(amp_dtype == torch.float16))
 
         checkpoint_dir = Path(config.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -731,8 +835,9 @@ def train(config: Config):
             train_loader = create_pretrain_middle_dataloaders(config, cache_paths)
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            scheduler = create_scheduler(optimizer, _num_optim_steps(train_loader, config.pretrain_middle_epochs, config), config.warmup_steps)
             for epoch in range(config.pretrain_middle_epochs):
-                loss = train_middle_epoch(model, train_loader, optimizer, scaler, device, config, epoch)
+                loss = train_middle_epoch(model, train_loader, optimizer, scaler, device, config, epoch, scheduler=scheduler)
                 print(f"Middle Pretrain Epoch {epoch+1}: loss={loss:.4f}")
 
             torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "pretrain_middle.pt", _use_new_zipfile_serialization=False)
@@ -748,6 +853,7 @@ def train(config: Config):
             adapter_loader = create_pretrain_adapter_dataloader(config, cache_paths)
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            scheduler = create_scheduler(optimizer, _num_optim_steps(adapter_loader, config.pretrain_adapter_epochs, config), config.warmup_steps)
             for epoch in range(config.pretrain_adapter_epochs):
                 loss = train_adapter_epoch(
                     model,
@@ -759,7 +865,8 @@ def train(config: Config):
                     epoch,
                     use_middle=getattr(config, "adapter_pretrain_use_middle", False),
                     is_summary=False,
-                    use_stop_latent=False
+                    use_stop_latent=False,
+                    scheduler=scheduler
                 )
                 print(f"Adapter Pretrain Epoch {epoch+1}: loss={loss:.4f}")
 
@@ -795,8 +902,9 @@ def train(config: Config):
             config.num_workers = original_num_workers
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            scheduler = create_scheduler(optimizer, _num_optim_steps(finetune_middle_loader, config.finetune_middle_epochs, config), config.warmup_steps)
             for epoch in range(config.finetune_middle_epochs):
-                loss = train_middle_finetune_epoch(model, finetune_middle_loader, optimizer, scaler, device, config, epoch)
+                loss = train_middle_finetune_epoch(model, finetune_middle_loader, optimizer, scaler, device, config, epoch, scheduler=scheduler)
                 print(f"Middle Fine-tune Epoch {epoch+1}: loss={loss:.4f}")
 
             torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "finetune_middle.pt", _use_new_zipfile_serialization=False)
@@ -815,6 +923,7 @@ def train(config: Config):
             config.num_workers = original_num_workers
             
             optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+            scheduler = create_scheduler(optimizer, _num_optim_steps(finetune_adapter_loader, config.finetune_adapter_epochs, config), config.warmup_steps)
             best_val_loss = float("inf")
             for epoch in range(config.finetune_adapter_epochs):
                 loss = train_adapter_epoch(
@@ -827,7 +936,8 @@ def train(config: Config):
                     epoch,
                     use_middle=True,
                     is_summary=True,
-                    use_stop_latent=True
+                    use_stop_latent=True,
+                    scheduler=scheduler
                 )
                 val_loss = validate_adapter_epoch(model, finetune_val_loader, device, config, use_middle=True)
                 print(f"Adapter Fine-tune Epoch {epoch+1}: loss={loss:.4f} | val_loss={val_loss:.4f}")
@@ -840,6 +950,8 @@ def train(config: Config):
             torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "finetune_adapter.pt", _use_new_zipfile_serialization=False)
 
         print("Two-stage pipeline complete.")
+        if getattr(config, "async_checkpointing", False):
+            _checkpoint_executor.shutdown(wait=True)
         return
     
     # Check for diagnostic test modes
@@ -896,6 +1008,7 @@ def train(config: Config):
     
     print("Initializing model...")
     model = LatentSpaceModel(config).to(device)
+    model = _maybe_compile_model(model, config)
     
     # For Test C: Freeze everything except prefix_adapter
     if test_mode == 'identity_task':
@@ -1000,7 +1113,9 @@ def train(config: Config):
         pass
 
     optimizer = AdamW(trainable_params_list, lr=config.learning_rate, weight_decay=config.weight_decay)
-    scaler = GradScaler(enabled=config.use_fp16)
+    amp_dtype = _get_amp_dtype(config, device)
+    scaler = GradScaler(enabled=(amp_dtype == torch.float16))
+    scheduler = create_scheduler(optimizer, _num_optim_steps(train_loader, config.num_epochs, config), config.warmup_steps)
     
     # Find and load latest checkpoint if it exists
     start_epoch = 0
@@ -1008,19 +1123,21 @@ def train(config: Config):
     latest_checkpoint = find_latest_checkpoint(config)
     if latest_checkpoint:
         try:
-            start_epoch, start_step = load_checkpoint(latest_checkpoint, model, optimizer, scaler, device, config)
+            start_epoch, start_step = load_checkpoint(latest_checkpoint, model, optimizer, scaler, device, config, scheduler=scheduler)
             print()
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             print("Starting from scratch...")
     
     if config.use_tui:
-        best_model_saved = run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step)
+        best_model_saved = run_tui_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step, scheduler=scheduler)
     else:
-        best_model_saved = run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step)
+        best_model_saved = run_simple_training(config, model, train_loader, val_loader, optimizer, scaler, device, start_epoch, start_step, scheduler=scheduler)
 
     # Cleanup logic
     cleanup_checkpoints(config, best_model_saved)
+    if getattr(config, "async_checkpointing", False):
+        _checkpoint_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

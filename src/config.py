@@ -25,6 +25,7 @@ class Config:
     max_seq_len: int = 512
     max_target_len: int = 256
     num_workers: int = 4  # Number of workers for data loading
+    prefetch_factor: int = 4  # Prefetch batches per worker (only when num_workers > 0)
     
     # Model names
     modernbert_model: str = "answerdotai/ModernBERT-base"  # Base is the standard/small option
@@ -38,7 +39,18 @@ class Config:
     # Device settings
     device: str = "cuda"  # Will be set automatically based on availability
     use_fp16: bool = True
+    use_bf16: bool = True  # Prefer BF16 when supported for speed/stability
     use_gradient_checkpointing: bool = True  # Reduce memory usage during backward pass
+    use_torch_compile: bool = True
+    torch_compile_mode: str = "reduce-overhead"
+    async_checkpointing: bool = True
+
+    # Attention + normalization/activation
+    attn_implementation: str | None = "flash_attention_2"  # Fallback to SDPA/eager if unavailable
+    use_rmsnorm: bool = True
+    rmsnorm_eps: float = 1e-6
+    use_prefix_rope: bool = True
+    rope_base: int = 10000
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"

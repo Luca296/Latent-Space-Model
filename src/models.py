@@ -8,6 +8,7 @@ Components:
 - LatentSpaceModel: Combined model
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,13 +27,75 @@ def _init_stop_latent(latent_dim: int, init: str = "random_normalized", seed: in
     raise ValueError(f"Unsupported stop_latent_init: {init}")
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        x_norm = x / rms
+        return x_norm * self.weight
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation (SiLU-gated linear unit)."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim * 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_proj = self.proj(x)
+        x_gated, x_linear = x_proj.chunk(2, dim=-1)
+        return F.silu(x_gated) * x_linear
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary positional embeddings (RoPE)."""
+
+    def __init__(self, dim: int, base: int = 10000):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("RotaryEmbedding requires an even dimension")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        cos = freqs.cos().to(dtype)
+        sin = freqs.sin().to(dtype)
+        return cos, sin
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary positional embeddings to a tensor of shape [B, T, D]."""
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    cos = cos.unsqueeze(0)
+    sin = sin.unsqueeze(0)
+    x_rot = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return x_rot.flatten(-2)
+
+
 class LatentEncoder(nn.Module):
     """Encoder that converts text tokens to a compact idea vector."""
     
-    def __init__(self, model_name: str, hidden_dim: int = 768, latent_dim: int = 256, 
-                 num_unfrozen_layers: int = 0):
+    def __init__(self, model_name: str, hidden_dim: int = 768, latent_dim: int = 256,
+                 num_unfrozen_layers: int = 0, attn_implementation: str | None = None,
+                 use_gradient_checkpointing: bool = False):
         super().__init__()
-        self.modernbert = AutoModel.from_pretrained(model_name)
+        if attn_implementation:
+            try:
+                self.modernbert = AutoModel.from_pretrained(model_name, attn_implementation=attn_implementation)
+            except Exception:
+                self.modernbert = AutoModel.from_pretrained(model_name)
+        else:
+            self.modernbert = AutoModel.from_pretrained(model_name)
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.num_unfrozen_layers = num_unfrozen_layers
@@ -47,6 +110,12 @@ class LatentEncoder(nn.Module):
         # Freeze ModernBERT backbone by default
         for param in self.modernbert.parameters():
             param.requires_grad = False
+
+        if use_gradient_checkpointing:
+            try:
+                self.modernbert.gradient_checkpointing_enable()
+            except Exception:
+                pass
     
     def unfreeze_top_layers(self, num_layers: int):
         """Unfreeze the top N transformer layers for fine-tuning."""
@@ -129,20 +198,31 @@ class MiddleModel(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        
+
         layers = []
         for i in range(num_layers):
             if i == 0:
-                layers.append(nn.Linear(latent_dim, hidden_dim))
+                in_dim = latent_dim
+                out_dim = hidden_dim
             elif i == num_layers - 1:
-                layers.append(nn.Linear(hidden_dim, latent_dim))
+                in_dim = hidden_dim
+                out_dim = latent_dim
             else:
-                layers.append(nn.Linear(hidden_dim, hidden_dim))
-            
+                in_dim = hidden_dim
+                out_dim = hidden_dim
+
             if i < num_layers - 1:
-                layers.append(nn.GELU())
-        
-        self.mlp = nn.Sequential(*layers)
+                layers.append(nn.Sequential(
+                    RMSNorm(in_dim, eps=1e-6),
+                    SwiGLU(in_dim, out_dim)
+                ))
+            else:
+                layers.append(nn.Sequential(
+                    RMSNorm(in_dim, eps=1e-6),
+                    nn.Linear(in_dim, out_dim)
+                ))
+
+        self.layers = nn.ModuleList(layers)
     
     def forward(self, z_in: torch.Tensor) -> torch.Tensor:
         """
@@ -154,7 +234,9 @@ class MiddleModel(nn.Module):
         Returns:
             z_out: [B, latent_dim] transformed idea vector
         """
-        z_out = self.mlp(z_in)
+        z_out = z_in
+        for layer in self.layers:
+            z_out = layer(z_out)
         return z_out
 
 
@@ -167,15 +249,15 @@ class PrefixAdapter(nn.Module):
         self.prefix_len = prefix_len
         self.gpt2_hidden_dim = gpt2_hidden_dim
         
-        # Deeper expansion MLP with no final activation
-        # This allows the output to match GPT-2's embedding distribution
+        # Deeper expansion MLP with RMSNorm + SwiGLU (no final activation)
         output_dim = prefix_len * gpt2_hidden_dim
         self.expansion_mlp = nn.Sequential(
-            nn.Linear(latent_dim, 1024),
-            nn.GELU(),
-            nn.Linear(1024, 2048),
-            nn.GELU(),
-            nn.Linear(2048, output_dim)  # No activation at the end!
+            RMSNorm(latent_dim, eps=1e-6),
+            SwiGLU(latent_dim, 1024),
+            RMSNorm(1024, eps=1e-6),
+            SwiGLU(1024, 2048),
+            RMSNorm(2048, eps=1e-6),
+            nn.Linear(2048, output_dim)
         )
     
     def forward(self, z_out: torch.Tensor) -> torch.Tensor:
@@ -218,11 +300,16 @@ class LatentSpaceModel(nn.Module):
         )
         
         # Initialize components
+        attn_impl = getattr(config, "attn_implementation", None)
+        use_gc = getattr(config, "use_gradient_checkpointing", False)
+
         self.encoder = LatentEncoder(
             model_name=config.modernbert_model,
             hidden_dim=config.modernbert_hidden_dim,
             latent_dim=config.latent_dim,
-            num_unfrozen_layers=getattr(config, 'num_encoder_unfrozen_layers', 0)
+            num_unfrozen_layers=getattr(config, 'num_encoder_unfrozen_layers', 0),
+            attn_implementation=attn_impl,
+            use_gradient_checkpointing=use_gc
         )
         
         self.middle_model = MiddleModel(
@@ -236,23 +323,52 @@ class LatentSpaceModel(nn.Module):
             prefix_len=config.prefix_len,
             gpt2_hidden_dim=config.gpt2_hidden_dim
         )
-        # LayerNorm to match GPT-2 embedding normalization
-        self.prefix_layernorm = nn.LayerNorm(config.gpt2_hidden_dim)
+        # Norm to match decoder embedding normalization
+        if getattr(config, "use_rmsnorm", True):
+            self.prefix_layernorm = RMSNorm(config.gpt2_hidden_dim, eps=getattr(config, "rmsnorm_eps", 1e-6))
+        else:
+            self.prefix_layernorm = nn.LayerNorm(config.gpt2_hidden_dim)
+
+        self.prefix_rope = None
+        if getattr(config, "use_prefix_rope", True):
+            try:
+                self.prefix_rope = RotaryEmbedding(
+                    dim=config.gpt2_hidden_dim,
+                    base=getattr(config, "rope_base", 10000)
+                )
+            except Exception:
+                self.prefix_rope = None
         
         # Load GPT-2 for decoding
-        self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
+        if attn_impl:
+            try:
+                self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model, attn_implementation=attn_impl)
+            except Exception:
+                self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
+        else:
+            self.gpt2 = AutoModelForCausalLM.from_pretrained(config.gpt2_model)
 
-        # Fixed STOP latent vector (float16)
+        # Fixed STOP latent vector
         stop_latent = _init_stop_latent(
             latent_dim=config.latent_dim,
             init=getattr(config, "stop_latent_init", "random_normalized"),
             seed=getattr(config, "stop_latent_seed", 1337)
-        ).to(dtype=torch.float16)
+        )
+        stop_dtype = torch.float16
+        if getattr(config, "use_bf16", False) and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            stop_dtype = torch.bfloat16
+        stop_latent = stop_latent.to(dtype=stop_dtype)
         self.register_buffer("STOP_LATENT", stop_latent)
         
         # Freeze GPT-2 backbone
         for param in self.gpt2.parameters():
             param.requires_grad = False
+
+        if use_gc:
+            try:
+                self.gpt2.gradient_checkpointing_enable()
+            except Exception:
+                pass
         
         # Get decoder token embeddings for teacher forcing
         # Handle both GPT-2 style (transformer.wte) and Gemma style (model.embed_tokens)
@@ -354,6 +470,9 @@ class LatentSpaceModel(nn.Module):
         # Expand to prefix embeddings
         prefix_embeddings = self.prefix_adapter(z_out)  # [B, prefix_len, gpt2_hidden_dim]
         prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
+        if self.prefix_rope is not None:
+            cos, sin = self.prefix_rope(self.config.prefix_len, prefix_embeddings.device, prefix_embeddings.dtype)
+            prefix_embeddings = apply_rope(prefix_embeddings, cos, sin)
         
         # Prepare target input for teacher forcing
         batch_size = target_ids.size(0)
@@ -410,6 +529,9 @@ class LatentSpaceModel(nn.Module):
 
         prefix_embeddings = self.prefix_adapter(z_out)
         prefix_embeddings = self.prefix_layernorm(prefix_embeddings)
+        if self.prefix_rope is not None:
+            cos, sin = self.prefix_rope(self.config.prefix_len, prefix_embeddings.device, prefix_embeddings.dtype)
+            prefix_embeddings = apply_rope(prefix_embeddings, cos, sin)
         # Cast to decoder model dtype (handles BFloat16, Float16, etc.)
         model_dtype = next(self.gpt2.parameters()).dtype
         return prefix_embeddings.to(model_dtype)
