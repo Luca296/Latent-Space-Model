@@ -118,6 +118,18 @@ def _maybe_compile_model(model: LatentSpaceModel, config: Config) -> LatentSpace
     return model
 
 
+def _maybe_cudagraph_step_begin(config: Config) -> None:
+    if not getattr(config, "use_torch_compile", False):
+        return
+    compiler = getattr(torch, "compiler", None)
+    if compiler is None:
+        return
+    mark_step = getattr(compiler, "cudagraph_mark_step_begin", None)
+    if mark_step is None:
+        return
+    mark_step()
+
+
 def append_stop_latent_to_latent_batch(
     z_in: torch.Tensor,
     z_target: torch.Tensor,
@@ -419,6 +431,7 @@ def train_epoch_tui(model, dataloader, optimizer, scaler, device, config, epoch,
         target_attention_mask = batch["target_attention_mask"].to(device)
         
         with _maybe_autocast(config, device):
+            _maybe_cudagraph_step_begin(config)
             logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
             loss = compute_loss(logits, target_ids, target_attention_mask)
             loss = loss / config.gradient_accumulation_steps
@@ -467,6 +480,7 @@ def validate_tui(model, dataloader, device, config, dashboard):
             target_attention_mask = batch["target_attention_mask"].to(device)
             
             with _maybe_autocast(config, device):
+                _maybe_cudagraph_step_begin(config)
                 logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
                 loss = compute_loss(logits, target_ids, target_attention_mask)
             
@@ -546,6 +560,7 @@ def train_epoch_simple(model, dataloader, optimizer, scaler, device, config, epo
         target_attention_mask = batch["target_attention_mask"].to(device)
         
         with _maybe_autocast(config, device):
+            _maybe_cudagraph_step_begin(config)
             logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
             loss = compute_loss(logits, target_ids, target_attention_mask)
             loss = loss / config.gradient_accumulation_steps
@@ -587,6 +602,7 @@ def validate_simple(model, dataloader, device, config):
             target_attention_mask = batch["target_attention_mask"].to(device)
             
             with _maybe_autocast(config, device):
+                _maybe_cudagraph_step_begin(config)
                 logits = model(input_ids, attention_mask, target_ids, target_attention_mask)
                 loss = compute_loss(logits, target_ids, target_attention_mask)
             
@@ -647,6 +663,7 @@ def train_middle_epoch(model, dataloader, optimizer, scaler, device, config, epo
             else:
                 raise KeyError("Batch missing idea or embedding fields")
             z_target = z_in
+            _maybe_cudagraph_step_begin(config)
             z_out = model.middle_model(z_in)
             loss = compute_latent_loss(z_out, z_target, config)
             loss = loss / config.gradient_accumulation_steps
@@ -686,6 +703,7 @@ def train_middle_finetune_epoch(model, dataloader, optimizer, scaler, device, co
         source_idea, target_idea = append_stop_latent_to_latent_batch(source_idea, target_idea, model)
 
         with _maybe_autocast(config, device):
+            _maybe_cudagraph_step_begin(config)
             z_out = model.middle_model(source_idea)
             loss = compute_latent_loss(z_out, target_idea, config)
             loss = loss / config.gradient_accumulation_steps
@@ -744,6 +762,7 @@ def train_adapter_epoch(model, dataloader, optimizer, scaler, device, config, ep
             )
 
         with _maybe_autocast(config, device):
+            _maybe_cudagraph_step_begin(config)
             logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
             loss = compute_loss(logits, target_ids, target_attention)
             loss = loss / config.gradient_accumulation_steps
@@ -780,6 +799,7 @@ def validate_adapter_epoch(model, dataloader, device, config, use_middle: bool) 
             target_ids = batch["summary_ids"].to(device)
             target_attention = batch["summary_attention_mask"].to(device)
             with _maybe_autocast(config, device):
+                _maybe_cudagraph_step_begin(config)
                 logits = model.forward_from_latent(z_in, target_ids, target_attention, use_middle=use_middle)
                 loss = compute_loss(logits, target_ids, target_attention)
             total_loss += loss.item()
@@ -823,6 +843,11 @@ def train(config: Config):
         model = LatentSpaceModel(config).to(device)
         model = _maybe_compile_model(model, config)
 
+        # Move model to correct dtype for mixed precision
+        amp_dtype = _get_amp_dtype(config, device)
+        if amp_dtype is not None:
+            model = model.to(dtype=amp_dtype)
+
         if cache_paths.get("compression_mlp") and Path(cache_paths["compression_mlp"]).exists():
             model.encoder.compression_mlp.load_state_dict(torch.load(cache_paths["compression_mlp"], map_location=device, weights_only=False))
             print("Loaded cached compression MLP weights.")
@@ -830,8 +855,6 @@ def train(config: Config):
         if getattr(config, "freeze_encoder_compression_in_pipeline", True):
             for param in model.encoder.compression_mlp.parameters():
                 param.requires_grad = False
-
-        amp_dtype = _get_amp_dtype(config, device)
         scaler = GradScaler(enabled=(amp_dtype == torch.float16))
 
         checkpoint_dir = Path(config.checkpoint_dir)
@@ -1025,6 +1048,11 @@ def train(config: Config):
     print("Initializing model...")
     model = LatentSpaceModel(config).to(device)
     model = _maybe_compile_model(model, config)
+    
+    # Move model to correct dtype for mixed precision
+    amp_dtype = _get_amp_dtype(config, device)
+    if amp_dtype is not None:
+        model = model.to(dtype=amp_dtype)
     
     # For Test C: Freeze everything except prefix_adapter
     if test_mode == 'identity_task':

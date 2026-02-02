@@ -29,8 +29,8 @@ class Config:
     
     # Training hyperparameters
     learning_rate: float = 2e-5
-    batch_size: int = 10
-    gradient_accumulation_steps: int = 6
+    batch_size: int = 30
+    gradient_accumulation_steps: int = 3
     max_seq_len: int = 512
     max_target_len: int = 256
     num_workers: int = 4  # Number of workers for data loading
@@ -50,7 +50,7 @@ class Config:
     use_fp16: bool = True
     use_bf16: bool = True  # Prefer BF16 when supported for speed/stability
     use_gradient_checkpointing: bool = True  # Reduce memory usage during backward pass
-    use_torch_compile: bool = True
+    use_torch_compile: bool = False
     torch_compile_mode: str = "reduce-overhead"
     async_checkpointing: bool = True
 
@@ -135,8 +135,8 @@ class Config:
     adapter_pretrain_use_middle: bool = False
 
     # Stage-specific epochs
-    pretrain_middle_epochs: int = 3
-    pretrain_adapter_epochs: int = 3
+    pretrain_middle_epochs: int = 6
+    pretrain_adapter_epochs: int = 24
     finetune_middle_epochs: int = 2
     finetune_adapter_epochs: int = 2
 
