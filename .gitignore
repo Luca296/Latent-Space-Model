@@ -6,3 +6,6 @@ config_saved.json
 .venv
 .claude
 /cache
+/docs_site/__pycache__
+/docs_site/.env
+/docs_site/rag/__pycache__

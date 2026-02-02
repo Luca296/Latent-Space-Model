@@ -1,0 +1,525 @@
+{% extends "layout.html" %}
+
+{% block title %}Latent-Space-Model Documentation{% endblock %}
+
+{% block content %}
+<!-- Hero Section -->
+<section class="hero">
+    <h1>Latent-Space-Model</h1>
+    <p class="tagline">A neural architecture for reasoning in compact latent space</p>
+    <div class="hero-buttons">
+        <a href="#overview" class="btn btn-primary">Read Overview</a>
+        <a href="#" class="btn btn-secondary" id="ask-docs-btn">Ask a Question</a>
+    </div>
+</section>
+
+<!-- Overview Section -->
+<section id="overview">
+    <h2>Overview</h2>
+
+    <h3 id="introduction">Introduction</h3>
+    <p>The Latent-Space-Model is a PyTorch prototype for a neural architecture that "thinks" in a compact latent "idea space" instead of directly in token space. Instead of processing text token-by-token throughout the entire pipeline, this model:</p>
+
+    <ol>
+        <li><strong>Encodes</strong> input text into a compact latent representation (8 x 256-dimensional vectors)</li>
+        <li><strong>Reasons</strong> in that latent space using a transformer-based middle model</li>
+        <li><strong>Decodes</strong> the transformed latent back into text</li>
+    </ol>
+
+    <p>This approach is inspired by world models and latent-space reasoning architectures, offering a fundamentally different paradigm from standard sequence-to-sequence models.</p>
+
+    <h3>Key Innovation</h3>
+    <p>The core innovation is the <strong>MiddleTransformer</strong>: a 4-layer transformer that operates directly on latent vectors, allowing multi-step reasoning to happen in a compressed "idea space" rather than in token space. This enables:</p>
+
+    <ul>
+        <li>Distributed representation across 8 latent positions</li>
+        <li>Self-attention for information exchange between latent vectors</li>
+        <li>More efficient processing for certain text-to-text tasks</li>
+    </ul>
+
+    <h3>Use Case: Dialogue Summarization</h3>
+    <p>The model is trained on the SAMSum dataset for dialogue summarization:</p>
+    <ul>
+        <li>Input: A conversation between multiple people</li>
+        <li>Latent encoding: Compressed representation of the dialogue's meaning</li>
+        <li>Middle reasoning: Transform dialogue idea to summary idea</li>
+        <li>Output: A concise summary of the conversation</li>
+    </ul>
+</section>
+
+<!-- Quick Start -->
+<section id="quick-start">
+    <h2>Quick Start</h2>
+
+    <h3>Installation</h3>
+    <pre><code>git clone &lt;repository-url&gt;
+cd Latent-Space-Model
+pip install -r requirements.txt</code></pre>
+
+    <h3>Basic Training</h3>
+    <pre><code>python main.py --mode train</code></pre>
+
+    <h3>Interactive Inference</h3>
+    <pre><code>python main.py --mode inference</code></pre>
+
+    <h3>System Requirements</h3>
+    <ul>
+        <li><strong>GPU:</strong> RTX 3060 (12GB VRAM) or equivalent</li>
+        <li><strong>RAM:</strong> 16GB+ recommended</li>
+        <li><strong>Storage:</strong> ~5GB for models and checkpoints</li>
+    </ul>
+</section>
+
+<!-- Architecture Section -->
+<section id="architecture">
+    <h2>Architecture</h2>
+
+    <p>The model consists of four main components connected in sequence:</p>
+
+    <div class="architecture-diagram">
+        <pre>
+Input Text (Dialogue)
+    |
+    v
+[ModernBERT Encoder]  → [B, L, 768]
+    |
+    v
+[Mean Pooling]        → [B, 768]
+    |
+    v
+[Compression MLP]     → [B, 8, 256] (Latent Sequence z_in)
+    |
+    v
+[MiddleTransformer]   → [B, 8, 256] (Transformed z_out)
+    |      (4 layers, self-attention)
+    v
+[Prefix Adapter]      → [B, 50, 640] (Cross-attention)
+    |
+    v
+[Gemma-3-270m Decoder]
+    |
+    v
+Output Text (Summary)</pre>
+    </div>
+</section>
+
+<!-- Encoder -->
+<section id="encoder">
+    <h2>Latent Encoder</h2>
+
+    <p>The encoder uses ModernBERT-base to convert input text into a compact latent representation.</p>
+
+    <h3>Architecture Details</h3>
+    <ul>
+        <li><strong>Backbone:</strong> <code>answerdotai/ModernBERT-base</code> (frozen during training)</li>
+        <li><strong>Hidden dimension:</strong> 768</li>
+        <li><strong>Pooling:</strong> Mean pooling over non-padded tokens</li>
+        <li><strong>Compression:</strong> MLP: 768 → 512 → 8×256</li>
+    </ul>
+
+    <h3>Data Flow</h3>
+    <pre><code>Input tokens:      [batch_size, seq_len]
+    |
+ModernBERT:        [batch_size, seq_len, 768]
+    |
+Mean pooling:      [batch_size, 768]
+    |
+Compression MLP:   [batch_size, 8, 256] = z_in</code></pre>
+
+    <h3>Key Feature: Latent Sequence</h3>
+    <p>Unlike a single bottleneck vector, the encoder outputs <strong>8 latent vectors</strong> of 256 dimensions each. This sequential structure allows the middle model to perform attention-based reasoning across multiple latent positions.</p>
+</section>
+
+<!-- Middle Model -->
+<section id="middle-model">
+    <h2>Middle Transformer</h2>
+
+    <p>The MiddleTransformer is the core reasoning module of the architecture. It operates purely in latent space, transforming one idea representation into another.</p>
+
+    <h3>The Critical Distinction</h3>
+    <p>This is <strong>NOT</strong> a simple bottleneck:</p>
+
+    <pre><code>NOT this (single vector):
+[B, 768] → [B, 256] → [B, 256] → [B, 768]
+
+BUT this (latent sequence with attention):
+[B, 768] → [B, 8, 256] → [Self-Attention] → [B, 8, 256] → [B, 50, 640]</code></pre>
+
+    <h3>Architecture</h3>
+    <ul>
+        <li><strong>Layers:</strong> 4 transformer blocks</li>
+        <li><strong>Model dimension:</strong> 256</li>
+        <li><strong>Attention heads:</strong> 4 (head dim = 64)</li>
+        <li><strong>FFN hidden dimension:</strong> 1024 (4× model dim)</li>
+        <li><strong>Sequence length:</strong> 8 latent positions</li>
+        <li><strong>Position encoding:</strong> RoPE (Rotary Position Embedding)</li>
+        <li><strong>Activation:</strong> SwiGLU</li>
+        <li><strong>Normalization:</strong> RMSNorm</li>
+    </ul>
+
+    <h3>Transformer Block</h3>
+    <p>Each layer follows the modern pre-norm transformer pattern:</p>
+    <pre><code>x = x + Attention(RMSNorm(x))
+x = x + SwiGLU-FFN(RMSNorm(x))</code></pre>
+
+    <h3>Self-Attention Across Latents</h3>
+    <p>The attention mechanism operates <strong>within</strong> the latent sequence:</p>
+    <ul>
+        <li>Query/Key/Value shape: [batch, 4 heads, 8 positions, 64 dim]</li>
+        <li>Attention scores: [batch, 4 heads, 8, 8]</li>
+        <li>Each of the 8 latent vectors can attend to the other 7</li>
+    </ul>
+
+    <p>This enables aggregation, distribution, and specialization across latent positions.</p>
+
+    <h3>Comparison to Alternatives</h3>
+    <table>
+        <tr><th>Architecture</th><th>Parameters</th><th>Reasoning Capability</th></tr>
+        <tr><td>Linear projection</td><td>~65K</td><td>None (static transform)</td></tr>
+        <tr><td>2-layer MLP</td><td>~262K</td><td>Limited nonlinearity</td></tr>
+        <tr><td><strong>4-layer Transformer</strong></td><td><strong>~2.1M</strong></td><td><strong>Full self-attention, multi-step</strong></td></tr>
+    </table>
+</section>
+
+<!-- Prefix Adapter -->
+<section id="prefix-adapter">
+    <h2>Prefix Adapter</h2>
+
+    <p>The PrefixAdapter bridges the gap between latent space and the decoder's embedding space using cross-attention.</p>
+
+    <h3>Architecture</h3>
+    <ul>
+        <li><strong>Mechanism:</strong> Multi-head cross-attention</li>
+        <li><strong>Query:</strong> Learnable embeddings [prefix_len, decoder_dim]</li>
+        <li><strong>Key/Value:</strong> From middle model output [batch, 8, 256]</li>
+        <li><strong>Output:</strong> Prefix embeddings [batch, prefix_len, decoder_dim]</li>
+        <li><strong>Prefix length:</strong> 50 (configurable)</li>
+        <li><strong>Decoder dimension:</strong> 640 (Gemma-3-270m)</li>
+    </ul>
+
+    <h3>Cross-Attention Flow</h3>
+    <pre><code>Latent output (z_out):    [B, 8, 256]
+                              |
+Learnable queries:        [prefix_len, 640]
+    |                         |
+    v                         v
+MultiHeadCrossAttention ------> [B, 50, 640]
+    |
+RMSNorm + SwiGLU-FFN
+    |
+Prefix embeddings:        [B, 50, 640]</code></pre>
+
+    <p>These prefix embeddings are prepended to the decoder inputs, conditioning generation on the transformed latent representation.</p>
+</section>
+
+<!-- Decoder -->
+<section id="decoder">
+    <h2>Decoder</h2>
+
+    <p>The decoder is a pretrained language model that generates output text conditioned on the latent prefix.</p>
+
+    <h3>Architecture</h3>
+    <ul>
+        <li><strong>Model:</strong> <code>google/gemma-3-270m-it</code></li>
+        <li><strong>Parameters:</strong> 270M</li>
+        <li><strong>Hidden dimension:</strong> 640</li>
+        <li><strong>Vocabulary size:</strong> 256k tokens</li>
+        <li><strong>Status:</strong> Frozen during training (except input embeddings)</li>
+    </ul>
+
+    <h3>Generation</h3>
+    <p>During inference:</p>
+    <ol>
+        <li>Prefix embeddings are concatenated with input prompt embeddings</li>
+        <li>The model autoregressively generates tokens</li>
+        <li>Generation continues until EOS token or max length</li>
+    </ol>
+
+    <h3>Stop Latent Mechanism</h3>
+    <p>A learnable "stop latent" vector is trained to signal end-of-generation:</p>
+    <pre><code>STOP_LATENT: [1, 8, 256] learned parameter
+
+During training: Concatenated to batches
+During inference: Can detect to stop generation early</code></pre>
+</section>
+
+<!-- Training Pipeline -->
+<section id="training">
+    <h2>Training Pipeline</h2>
+
+    <p>The model uses a 4-stage training curriculum designed to gradually build capabilities:</p>
+
+    <div class="training-stages">
+        <h3>Stage 1: Middle Model Pretraining</h3>
+        <ul>
+            <li><strong>Goal:</strong> Teach the middle model to preserve and transform latent representations</li>
+            <li><strong>Trainable:</strong> MiddleTransformer only</li>
+            <li><strong>Frozen:</strong> Encoder, PrefixAdapter, Decoder</li>
+            <li><strong>Data:</strong> WikiText-103, arXiv Abstracts, English Pretraining Dataset</li>
+            <li><strong>Task:</strong> Autoencoding (reconstruct input latents)</li>
+            <li><strong>Loss:</strong> MSE + Contrastive learning</li>
+            <li><strong>Epochs:</strong> 6</li>
+        </ul>
+
+        <h3>Stage 2: Adapter Pretraining</h3>
+        <ul>
+            <li><strong>Goal:</strong> Map latents to decoder embeddings</li>
+            <li><strong>Trainable:</strong> PrefixAdapter</li>
+            <li><strong>Frozen:</strong> Encoder, MiddleTransformer (optional), Decoder</li>
+            <li><strong>Data:</strong> Cached latents from scientific pretraining</li>
+            <li><strong>Task:</strong> Generate text from latents</li>
+            <li><strong>Loss:</strong> Cross-entropy on decoder outputs</li>
+            <li><strong>Epochs:</strong> 4</li>
+        </ul>
+
+        <h3>Stage 3: Middle Model Fine-tuning</h3>
+        <ul>
+            <li><strong>Goal:</strong> Transform dialogue ideas to summary ideas</li>
+            <li><strong>Trainable:</strong> MiddleTransformer only</li>
+            <li><strong>Frozen:</strong> Encoder, PrefixAdapter, Decoder</li>
+            <li><strong>Data:</strong> SAMSum dataset (cached source/target ideas)</li>
+            <li><strong>Task:</strong> Dialogue summarization in latent space</li>
+            <li><strong>Loss:</strong> MSE between transformed and target latents</li>
+            <li><strong>Epochs:</strong> 2</li>
+        </ul>
+
+        <h3>Stage 4: Adapter Fine-tuning</h3>
+        <ul>
+            <li><strong>Goal:</strong> End-to-end generation quality</li>
+            <li><strong>Trainable:</strong> PrefixAdapter only</li>
+            <li><strong>Frozen:</strong> Encoder, MiddleTransformer, Decoder</li>
+            <li><strong>Data:</strong> SAMSum full pipeline</li>
+            <li><strong>Task:</strong> Generate actual summaries</li>
+            <li><strong>Loss:</strong> Cross-entropy</li>
+            <li><strong>Epochs:</strong> 2</li>
+        </ul>
+    </div>
+
+    <h3>Loss Functions</h3>
+    <pre><code># Latent space loss (Stages 1 & 3)
+mse = F.mse_loss(z_pred, z_target)
+contrastive = compute_contrastive_loss(z_pred, z_target)
+latent_loss = mse + 0.1 * contrastive
+
+# Text generation loss (Stages 2 & 4)
+text_loss = cross_entropy(logits, target_tokens)</code></pre>
+</section>
+
+<!-- Running Training -->
+<section id="training-guide">
+    <h2>Running Training</h2>
+
+    <h3>Basic Training</h3>
+    <pre><code># Default training with all 4 stages
+python main.py --mode train</code></pre>
+
+    <h3>Custom Hyperparameters</h3>
+    <pre><code>python main.py --mode train \
+    --batch-size 8 \
+    --learning-rate 1e-4 \
+    --epochs 5 \
+    --max-train-samples 10000</code></pre>
+
+    <h3>Web Interface</h3>
+    <pre><code># Launch web UI for training control
+python main.py --website</code></pre>
+
+    <h3>Diagnostic Test Modes</h3>
+    <p>The codebase includes several diagnostic modes for debugging:</p>
+
+    <table>
+        <tr><th>Phase</th><th>Description</th><th>Command</th></tr>
+        <tr><td>phase1</td><td>Align decoder (identity mapping)</td><td><code>--training-phase phase1</code></td></tr>
+        <tr><td>phase2</td><td>Train encoder compression</td><td><code>--training-phase phase2</code></td></tr>
+        <tr><td>phase3</td><td>Train middle model only</td><td><code>--training-phase phase3</code></td></tr>
+        <tr><td>bypass_middle</td><td>Skip middle transformer</td><td>built-in flag</td></tr>
+    </table>
+</section>
+
+<!-- Configuration -->
+<section id="configuration">
+    <h2>Configuration Guide</h2>
+
+    <p>All hyperparameters are defined in <code>src/config.py</code> as a dataclass.</p>
+
+    <h3>Modifying Configuration</h3>
+    <p>You can modify config through:</p>
+    <ol>
+        <li><strong>CLI arguments:</strong> Passed via argparse in <code>main.py</code></li>
+        <li><strong>Programmatic:</strong> Direct modification of Config instance</li>
+    </ol>
+</section>
+
+<!-- Hyperparameters -->
+<section id="hyperparameters">
+    <h2>Hyperparameters</h2>
+
+    <h3>Model Dimensions</h3>
+    <table>
+        <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>latent_dim</code></td><td>256</td><td>Dimension of each latent vector</td></tr>
+        <tr><td><code>latent_seq_len</code></td><td>8</td><td>Number of latent vectors in sequence</td></tr>
+        <tr><td><code>prefix_len</code></td><td>50</td><th>Length of decoder prefix</td></tr>
+        <tr><td><code>modernbert_hidden_dim</code></td><td>768</td><td>ModernBERT hidden size</td></tr>
+        <tr><td><code>middle_layers</code></td><td>4</td><td>Number of middle transformer layers</td></tr>
+        <tr><td><code>middle_num_heads</code></td><td>4</td><td>Attention heads in middle model</td></tr>
+        <tr><td><code>middle_ffn_multiplier</code></td><td>4.0</td><td>FFN hidden = dim × multiplier</td></tr>
+    </table>
+
+    <h3>Training Hyperparameters</h3>
+    <table>
+        <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>learning_rate</code></td><td>2e-5</td><td>Learning rate</td></tr>
+        <tr><td><code>batch_size</code></td><td>30</td><td>Global batch size</td></tr>
+        <tr><td><code>gradient_accumulation_steps</code></td><td>3</td><td>For effective larger batches</td></tr>
+        <tr><td><code>max_seq_len</code></td><td>512</td><td>Maximum input sequence length</td></tr>
+        <tr><td><code>max_target_len</code></td><td>256</td><td>Maximum target sequence length</td></tr>
+        <tr><td><code>num_epochs</code></td><td>50</td><td>Total training epochs</td></tr>
+        <tr><td><code>warmup_steps</code></td><td>200</td><td>LR warmup steps</td></tr>
+        <tr><td><code>weight_decay</code></td><td>0.01</td><td>AdamW weight decay</td></tr>
+    </table>
+
+    <h3>Stage-Specific Epochs</h3>
+    <table>
+        <tr><th>Stage</th><th>Epochs</th></tr>
+        <tr><td>Pretrain middle</td><td>6</td></tr>
+        <tr><td>Pretrain adapter</td><td>4</td></tr>
+        <tr><td>Finetune middle</td><td>2</td></tr>
+        <tr><td>Finetune adapter</td><td>2</td></tr>
+    </table>
+
+    <h3>Model Names</h3>
+    <table>
+        <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>modernbert_model</code></td><td>answerdotai/ModernBERT-base</td><td>Encoder model</td></tr>
+        <tr><td><code>gpt2_model</code></td><td>google/gemma-3-270m-it</td><td>Decoder model</td></tr>
+    </table>
+</section>
+
+<!-- Inference -->
+<section id="inference">
+    <h2>Inference</h2>
+
+    <h3>Interactive Mode</h3>
+    <pre><code>python main.py --mode inference</code></pre>
+    <p>This launches an interactive REPL where you can type input text and see generated summaries.</p>
+
+    <h3>Batch Generation</h3>
+    <pre><code>python main.py --mode generate \
+    --input "Your input dialogue here..." \
+    --checkpoint checkpoints/best_model.pt</code></pre>
+
+    <h3>Generation Parameters</h3>
+    <table>
+        <tr><th>Parameter</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>temperature</code></td><td>0.7</td><td>Sampling temperature</td></tr>
+        <tr><td><code>max_generation_length</code></td><td>256</td><td>Maximum tokens to generate</td></tr>
+        <tr><td><code>top_p</code></td><td>0.9</td><td>Nucleus sampling parameter</td></tr>
+        <tr><td><code>top_k</code></td><td>50</td><td>Top-k sampling</td></tr>
+    </table>
+</section>
+
+<!-- Generation -->
+<section id="generation">
+    <h2>Text Generation</h2>
+
+    <h3>Python API</h3>
+    <pre><code>from src.inference import LatentSpaceInference
+from src.config import Config
+
+config = Config()
+inference = LatentSpaceInference(
+    checkpoint_path="checkpoints/best_model.pt",
+    config=config
+)
+
+# Generate summary
+text = "Your input dialogue here..."
+summary = inference.generate(text)
+print(summary)</code></pre>
+
+    <h3>Latent Interpolation</h3>
+    <p>Explore the latent space by interpolating between two inputs:</p>
+    <pre><code>result = inference.interpolate_and_generate(
+    input_text_1="First dialogue...",
+    input_text_2="Second dialogue...",
+    alpha=0.5  # 0.0 = first, 1.0 = second
+)</code></pre>
+
+    <h3>Extract Latent Vectors</h3>
+    <pre><code>latent = inference.get_latent_vector("Your text here")
+print(f"Shape: {latent.shape}")  # torch.Size([8, 256])</code></pre>
+</section>
+
+<!-- Data and Caching -->
+<section id="data">
+    <h2>Data and Caching</h2>
+
+    <h3>Dataset</h3>
+    <p>The model primarily uses the SAMSum dataset (loaded via Hugging Face):</p>
+    <ul>
+        <li><strong>Source:</strong> <code>knkarthick/samsum</code></li>
+        <li><strong>Splits:</strong> train, validation, test</li>
+        <li><strong>Size:</strong> ~14,700 dialogue-summary pairs</li>
+        <li><strong>Task:</strong> Dialogue summarization</li>
+    </ul>
+
+    <h3>Scientific Pretraining Datasets</h3>
+    <p>For stage 1 middle model pretraining:</p>
+    <ul>
+        <li><strong>WikiText-103:</strong> <code>Hieuman/wikitext-103-filtered</code> (up to 750K samples)</li>
+        <li><strong>arXiv Abstracts:</strong> <code>macrocosm/arxiv_abstracts</code> (up to 750K samples)</li>
+        <li><strong>English Pretraining:</strong> <code>shuyuej/English-Pretraining-Dataset</code></li>
+    </ul>
+
+    <h3>Caching</h3>
+    <p>To speed up training, latent embeddings are precomputed and cached:</p>
+    <ul>
+        <li><strong>Location:</strong> <code>cache/preprocessed/</code></li>
+        <li><strong>Format:</strong> JSONL with int8 quantization</li>
+        <li><strong>Memory savings:</strong> ~75% reduction vs fp32</li>
+    </ul>
+
+    <h3>Int8 Quantization</h3>
+    <pre><code># Dequantization during training
+emb_q_int8 = cached_embedding  # np.int8
+scale = cached_scale           # float32
+embedding = (emb_q_int8.astype(float) * scale).astype(np.float16)</code></pre>
+
+    <h3>Cache Directory Structure</h3>
+    <pre><code>cache/preprocessed/
+├── samsum/
+│   ├── train/
+│   ├── validation/
+│   └── test/
+├── wikitext/
+├── arxiv/
+└── english_pretrain/</code></pre>
+</section>
+
+<!-- FAQ -->
+<section id="faq">
+    <h2>FAQ</h2>
+
+    <h3>Why not just use a standard encoder-decoder model?</h3>
+    <p>Standard seq2seq models (like T5, BART) process text through stacked transformer layers. This architecture explicitly compresses to a compact "idea space" and reasons there, which is closer to world models and latent-space reasoning paradigms.</p>
+
+    <h3>Why 8 latent vectors instead of 1?</h3>
+    <p>A single 256-dim vector is too constrained for complex transformations. The 8-vector sequence allows distributed representation and self-attention between positions, enabling more sophisticated reasoning.</p>
+
+    <h3>Why ModernBERT and Gemma?</h3>
+    <p>ModernBERT offers superior contextual representations with a modern architecture. Gemma-3-270m is an efficient decoder that fits within RTX 3060 memory constraints while providing good generation quality.</p>
+
+    <h3>How much VRAM does training need?</h3>
+    <p>With batch size 30, gradient accumulation 3, and mixed precision (bf16), training uses approximately 10-11GB of VRAM on an RTX 3060 12GB.</p>
+
+    <h3>Can I use this for other tasks besides summarization?</h3>
+    <p>Yes, the architecture is task-agnostic. The 4-stage pipeline can be adapted to any text-to-text task (paraphrasing, translation, question answering, style transfer).</p>
+
+    <h3>Why frozen backbones?</h3>
+    <p>Freezing ModernBERT and Gemma significantly reduces memory usage and training time, allowing experimentation with limited hardware. The trainable components (compression, middle model, prefix adapter) are sufficient for task adaptation.</p>
+
+    <h3>What's the stop latent mechanism?</h3>
+    <p>A learned vector that acts as an end-of-generation signal. During training, it's concatenated to batches; during inference, similarity to this vector can trigger early stopping.</p>
+</section>
+{% endblock %}

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Latent-Space-Model Documentation{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/site.css') }}">
+</head>
+<body>
+    <!-- Header -->
+    <header class="site-header">
+        <div class="header-left">
+            <a href="/" class="logo">Latent-Space-Model</a>
+        </div>
+        <div class="header-center">
+            <input type="search" placeholder="Search docs..." class="search-box" id="search-box">
+        </div>
+        <div class="header-right">
+            <button id="theme-toggle" aria-label="Toggle theme">
+                <svg class="sun-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="5"/>
+                    <line x1="12" y1="1" x2="12" y2="3"/>
+                    <line x1="12" y1="21" x2="12" y2="23"/>
+                    <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+                    <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                    <line x1="1" y1="12" x2="3" y2="12"/>
+                    <line x1="21" y1="12" x2="23" y2="12"/>
+                    <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+                    <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+                </svg>
+                <svg class="moon-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                </svg>
+            </button>
+        </div>
+    </header>
+
+    <div class="page-container">
+        <!-- Left Sidebar Navigation -->
+        <aside class="sidebar-left">
+            <nav class="nav-menu">
+                <div class="nav-section">
+                    <button class="nav-toggle active">Overview</button>
+                    <ul class="nav-submenu expanded">
+                        <li><a href="#introduction">Introduction</a></li>
+                        <li><a href="#quick-start">Quick Start</a></li>
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <button class="nav-toggle">Architecture</button>
+                    <ul class="nav-submenu">
+                        <li><a href="#architecture">Overview</a></li>
+                        <li><a href="#encoder">Latent Encoder</a></li>
+                        <li><a href="#middle-model">Middle Transformer</a></li>
+                        <li><a href="#prefix-adapter">Prefix Adapter</a></li>
+                        <li><a href="#decoder">Decoder</a></li>
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <button class="nav-toggle">Training</button>
+                    <ul class="nav-submenu">
+                        <li><a href="#training">Training Pipeline</a></li>
+                        <li><a href="#training-guide">Running Training</a></li>
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <button class="nav-toggle">Configuration</button>
+                    <ul class="nav-submenu">
+                        <li><a href="#configuration">Configuration Guide</a></li>
+                        <li><a href="#hyperparameters">Hyperparameters</a></li>
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <button class="nav-toggle">Inference</button>
+                    <ul class="nav-submenu">
+                        <li><a href="#inference">Inference Modes</a></li>
+                        <li><a href="#generation">Generation</a></li>
+                    </ul>
+                </div>
+                <div class="nav-section">
+                    <button class="nav-toggle">Reference</button>
+                    <ul class="nav-submenu">
+                        <li><a href="#data">Data and Caching</a></li>
+                        <li><a href="#faq">FAQ</a></li>
+                    </ul>
+                </div>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="content">
+            {% block content %}{% endblock %}
+        </main>
+
+        <!-- Right Sidebar (TOC) -->
+        <aside class="sidebar-right">
+            <div class="toc">
+                <h3>In this article</h3>
+                <ul id="toc-list"></ul>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Ask Docs Chatbot -->
+    <div id="chatbot-container">
+        <button id="chatbot-toggle" class="chatbot-fab">
+            Ask Docs
+        </button>
+        <div id="chatbot-panel" class="chatbot-panel hidden">
+            <div class="chatbot-header">
+                <h3>Ask Docs</h3>
+                <button id="chatbot-close">X</button>
+            </div>
+            <div class="chatbot-welcome">
+                <p>Hello! I can help you find answers in the Latent-Space-Model docs. What are you looking for?</p>
+                <div class="example-questions">
+                    <button class="example-q">Walk me through training setup</button>
+                    <button class="example-q">What is the MiddleTransformer?</button>
+                    <button class="example-q">How do I change model config?</button>
+                    <button class="example-q">Explain the 4-stage pipeline</button>
+                </div>
+            </div>
+            <div class="chat-history"></div>
+            <div class="chat-input-area">
+                <input type="text" id="chat-input" placeholder="How can I help you?">
+                <button id="chat-send">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+</body>
+</html>
