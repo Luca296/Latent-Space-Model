@@ -862,24 +862,32 @@ def train(config: Config):
         handoff_best_path = checkpoint_dir / config.handoff_best_model_filename
         pretrain_best_path = checkpoint_dir / config.pretrain_best_model_filename
         finetune_best_path = checkpoint_dir / config.finetune_best_model_filename
+        pretrain_middle_path = checkpoint_dir / "pretrain_middle.pt"
 
         # Pretraining: Middle model
         if getattr(config, "run_pretraining", True):
-            print("\nStage 1: Middle Model Pretraining")
-            for param in model.parameters():
-                param.requires_grad = False
-            for param in model.middle_model.parameters():
-                param.requires_grad = True
+            # Check if pretrain_middle.pt already exists
+            if pretrain_middle_path.exists():
+                print("\nStage 1: Middle Model Pretraining (SKIPPED - pretrain_middle.pt already exists)")
+                checkpoint = torch.load(pretrain_middle_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                print("Loaded pretrain_middle.pt checkpoint")
+            else:
+                print("\nStage 1: Middle Model Pretraining")
+                for param in model.parameters():
+                    param.requires_grad = False
+                for param in model.middle_model.parameters():
+                    param.requires_grad = True
 
-            train_loader = create_pretrain_middle_dataloaders(config, cache_paths)
-            
-            optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
-            scheduler = create_scheduler(optimizer, _num_optim_steps(train_loader, config.pretrain_middle_epochs, config), config.warmup_steps)
-            for epoch in range(config.pretrain_middle_epochs):
-                loss = train_middle_epoch(model, train_loader, optimizer, scaler, device, config, epoch, scheduler=scheduler)
-                print(f"Middle Pretrain Epoch {epoch+1}: loss={loss:.4f}")
+                train_loader = create_pretrain_middle_dataloaders(config, cache_paths)
+                
+                optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=config.learning_rate, weight_decay=config.weight_decay)
+                scheduler = create_scheduler(optimizer, _num_optim_steps(train_loader, config.pretrain_middle_epochs, config), config.warmup_steps)
+                for epoch in range(config.pretrain_middle_epochs):
+                    loss = train_middle_epoch(model, train_loader, optimizer, scaler, device, config, epoch, scheduler=scheduler)
+                    print(f"Middle Pretrain Epoch {epoch+1}: loss={loss:.4f}")
 
-            torch.save({"model_state_dict": model.state_dict(), "config": config}, checkpoint_dir / "pretrain_middle.pt", _use_new_zipfile_serialization=False)
+                torch.save({"model_state_dict": model.state_dict(), "config": config}, pretrain_middle_path, _use_new_zipfile_serialization=False)
 
             print("\nStage 2: Adapter Pretraining")
             for param in model.parameters():

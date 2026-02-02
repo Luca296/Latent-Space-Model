@@ -136,7 +136,7 @@ class Config:
 
     # Stage-specific epochs
     pretrain_middle_epochs: int = 6
-    pretrain_adapter_epochs: int = 24
+    pretrain_adapter_epochs: int = 4
     finetune_middle_epochs: int = 2
     finetune_adapter_epochs: int = 2
 
