@@ -8,12 +8,13 @@ import sys
 # Add the current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flask import Flask, render_template, request, jsonify
+import json
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from config import Config
 from rag.index import build_index
 from rag.retrieve import retrieve
 from rag.rerank import rerank
-from rag.answer import generate_answer
+from rag.answer import generate_answer, generate_answer_stream
 from rag.store import index_exists
 
 
@@ -64,6 +65,51 @@ def create_app():
 
         except Exception as e:
             return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/ask_stream', methods=['POST'])
+    def ask_stream():
+        """
+        Streaming RAG pipeline endpoint.
+
+        Request body: {question: string, history: array}
+        Response: text/event-stream with delta chunks and sources.
+        """
+        def format_sse(event_type: str, data: dict) -> str:
+            return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+        @stream_with_context
+        def generate():
+            try:
+                data = request.get_json()
+                if not data or 'question' not in data:
+                    yield format_sse('delta', {'content': 'Error: Missing question field'})
+                    yield format_sse('sources', {'sources': []})
+                    yield format_sse('done', {})
+                    return
+
+                question = data['question']
+                history = data.get('history', [])
+
+                candidates = retrieve(question)
+                reranked = rerank(question, candidates)
+
+                for payload in generate_answer_stream(question, reranked, history):
+                    if payload.get('type') == 'delta':
+                        yield format_sse('delta', {'content': payload.get('content', '')})
+                    elif payload.get('type') == 'sources':
+                        yield format_sse('sources', {'sources': payload.get('sources', [])})
+                    elif payload.get('type') == 'done':
+                        yield format_sse('done', {})
+
+            except Exception as e:
+                yield format_sse('delta', {'content': f'Error: {str(e)}'})
+                yield format_sse('sources', {'sources': []})
+                yield format_sse('done', {})
+
+        response = Response(generate(), mimetype='text/event-stream')
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['X-Accel-Buffering'] = 'no'
+        return response
 
     @app.route('/api/chat', methods=['POST'])
     def chat():

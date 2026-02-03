@@ -3,7 +3,7 @@ Answer generation using Groq API.
 Builds prompts and generates answers from retrieved context.
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Generator
 from groq import Groq
 from config import Config
 
@@ -111,6 +111,97 @@ def generate_answer(
             'answer': f'Error generating answer: {str(e)}',
             'sources': []
         }
+
+
+def generate_answer_stream(
+    question: str,
+    chunks: List[dict],
+    history: Optional[List[Dict[str, str]]] = None
+) -> Generator[Dict[str, any], None, None]:
+    """
+    Stream an answer using Groq API.
+
+    Yields dictionaries with:
+      - type: "delta" with partial content
+      - type: "sources" with extracted sources
+      - type: "done" when finished
+    """
+    if not Config.GROQ_API_KEY:
+        yield {
+            'type': 'delta',
+            'content': 'Error: GROQ_API_KEY not configured. Please set it in your .env file.'
+        }
+        yield {
+            'type': 'sources',
+            'sources': []
+        }
+        yield {'type': 'done'}
+        return
+
+    if not chunks:
+        yield {
+            'type': 'delta',
+            'content': 'I could not find any relevant documentation to answer your question.'
+        }
+        yield {
+            'type': 'sources',
+            'sources': []
+        }
+        yield {'type': 'done'}
+        return
+
+    client = Groq(api_key=Config.GROQ_API_KEY)
+
+    messages = [
+        {'role': 'system', 'content': SYSTEM_PROMPT}
+    ]
+
+    if history:
+        for msg in history[-4:]:
+            messages.append(msg)
+
+    prompt = build_prompt(question, chunks)
+    messages.append({'role': 'user', 'content': prompt})
+
+    answer_parts: List[str] = []
+
+    try:
+        stream = client.chat.completions.create(
+            model=Config.GROQ_MODEL,
+            messages=messages,
+            temperature=0.5,
+            max_tokens=1024,
+            top_p=0.9,
+            stream=True
+        )
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ''
+            if delta:
+                answer_parts.append(delta)
+                yield {
+                    'type': 'delta',
+                    'content': delta
+                }
+
+        full_answer = ''.join(answer_parts)
+        sources = extract_sources(full_answer, chunks)
+        yield {
+            'type': 'sources',
+            'sources': sources
+        }
+        yield {'type': 'done'}
+
+    except Exception as e:
+        yield {
+            'type': 'delta',
+            'content': f'Error generating answer: {str(e)}'
+        }
+        yield {
+            'type': 'sources',
+            'sources': []
+        }
+        yield {'type': 'done'}
 
 
 def extract_sources(answer: str, chunks: List[dict]) -> List[dict]:

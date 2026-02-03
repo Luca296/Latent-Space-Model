@@ -43,6 +43,7 @@ function initChatbot() {
     const fab = document.getElementById('chatbot-toggle');
     const sidebar = document.getElementById('chatbot-sidebar');
     const closeBtn = document.getElementById('chatbot-close');
+    const newChatBtn = document.getElementById('new-chat');
     const input = document.getElementById('chat-input');
     const sendBtn = document.getElementById('chat-send');
     const history = document.querySelector('.chat-history');
@@ -53,17 +54,28 @@ function initChatbot() {
     // Open chatbot
     function openChatbot() {
         sidebar.classList.add('open');
+        document.body.classList.add('chat-open');
         input.focus();
     }
 
     // Close chatbot
     function closeChatbot() {
         sidebar.classList.remove('open');
+        document.body.classList.remove('chat-open');
     }
 
     // Toggle chatbot panel
     if (fab) fab.addEventListener('click', openChatbot);
     if (closeBtn) closeBtn.addEventListener('click', closeChatbot);
+    if (newChatBtn) {
+        newChatBtn.addEventListener('click', function() {
+            conversationHistory = [];
+            if (history) history.innerHTML = '';
+            if (welcome) welcome.style.display = 'block';
+            if (input) input.value = '';
+            openChatbot();
+        });
+    }
 
     // Open chatbot from hero button
     if (askDocsBtn) {
@@ -103,17 +115,18 @@ function initChatbot() {
 
     // Send question to API
     async function sendQuestion(question) {
-        // Show typing indicator
         const typingId = showTypingIndicator();
-
-        // Disable send button
         sendBtn.disabled = true;
 
+        let botMessageDiv = null;
+        let botText = '';
+        let botSources = [];
+
         try {
-            const response = await fetch('/api/ask', {
+            const response = await fetch('/api/ask_stream', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
                     question: question,
@@ -121,27 +134,55 @@ function initChatbot() {
                 })
             });
 
-            // Remove typing indicator
-            removeTypingIndicator(typingId);
-
-            if (response.ok) {
-                const data = await response.json();
-
-                // Add bot response
-                addMessage(data.answer, 'bot', data.sources);
-
-                // Update conversation history
-                conversationHistory.push(
-                    { role: 'user', content: question },
-                    { role: 'assistant', content: data.answer }
-                );
-
-                // Keep only last 4 exchanges (8 messages)
-                if (conversationHistory.length > 8) {
-                    conversationHistory = conversationHistory.slice(-8);
-                }
-            } else {
+            if (!response.ok || !response.body) {
+                removeTypingIndicator(typingId);
                 addMessage('Sorry, I encountered an error. Please try again.', 'bot');
+                sendBtn.disabled = false;
+                return;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop() || '';
+
+                for (const part of parts) {
+                    const event = parseSSE(part);
+                    if (!event) continue;
+
+                    if (event.type === 'delta') {
+                        if (typingId) removeTypingIndicator(typingId);
+                        if (!botMessageDiv) {
+                            botMessageDiv = addMessage('', 'bot');
+                        }
+                        botText += event.data.content || '';
+                        updateMessage(botMessageDiv, botText, botSources);
+                    }
+
+                    if (event.type === 'sources') {
+                        botSources = event.data.sources || [];
+                        if (botMessageDiv) updateMessage(botMessageDiv, botText, botSources);
+                    }
+
+                    if (event.type === 'done') {
+                        if (botMessageDiv) {
+                            conversationHistory.push(
+                                { role: 'user', content: question },
+                                { role: 'assistant', content: botText }
+                            );
+                            if (conversationHistory.length > 8) {
+                                conversationHistory = conversationHistory.slice(-8);
+                            }
+                        }
+                    }
+                }
             }
         } catch (error) {
             removeTypingIndicator(typingId);
@@ -149,7 +190,6 @@ function initChatbot() {
             console.error('Error:', error);
         }
 
-        // Re-enable send button
         sendBtn.disabled = false;
     }
 
@@ -171,36 +211,104 @@ function initChatbot() {
 
         const bubble = document.createElement('div');
         bubble.className = 'message-bubble';
-        bubble.textContent = text;
+        bubble.innerHTML = renderMarkdown(text);
 
         messageDiv.appendChild(bubble);
 
-        // Add sources if available
         if (sources && sources.length > 0 && sender === 'bot') {
-            const sourcesDiv = document.createElement('div');
-            sourcesDiv.className = 'message-sources';
-
-            const sourcesTitle = document.createElement('strong');
-            sourcesTitle.textContent = 'Sources:';
-            sourcesDiv.appendChild(sourcesTitle);
-
-            sources.forEach(source => {
-                const link = document.createElement('a');
-                link.className = 'source-link';
-                link.href = '#';
-                link.textContent = `[${source.id}] ${source.source} - ${source.section}`;
-                link.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    // Could scroll to source anchor or open source viewer
-                });
-                sourcesDiv.appendChild(link);
-            });
-
-            messageDiv.appendChild(sourcesDiv);
+            const sourcesDiv = buildSources(sources);
+            bubble.appendChild(sourcesDiv);
         }
 
         history.appendChild(messageDiv);
         history.scrollTop = history.scrollHeight;
+
+        return messageDiv;
+    }
+
+    function updateMessage(messageDiv, text, sources = []) {
+        const bubble = messageDiv.querySelector('.message-bubble');
+        if (!bubble) return;
+        bubble.innerHTML = renderMarkdown(text);
+
+        const existingSources = bubble.querySelector('.message-sources');
+        if (existingSources) existingSources.remove();
+
+        if (sources && sources.length > 0) {
+            bubble.appendChild(buildSources(sources));
+        }
+
+        history.scrollTop = history.scrollHeight;
+    }
+
+    function buildSources(sources) {
+        const sourcesDiv = document.createElement('div');
+        sourcesDiv.className = 'message-sources';
+
+        const sourcesTitle = document.createElement('strong');
+        sourcesTitle.textContent = 'Sources:';
+        sourcesDiv.appendChild(sourcesTitle);
+
+        sources.forEach(source => {
+            const link = document.createElement('a');
+            link.className = 'source-link';
+            const anchor = '#' + slugify(source.section || '');
+            link.href = anchor;
+            link.textContent = `[${source.id}] ${source.source} - ${source.section}`;
+            link.addEventListener('click', function(e) {
+                const targetId = anchor.replace('#', '');
+                const target = document.getElementById(targetId);
+                if (target) {
+                    e.preventDefault();
+                    target.scrollIntoView({ behavior: 'smooth' });
+                }
+            });
+            sourcesDiv.appendChild(link);
+        });
+
+        return sourcesDiv;
+    }
+
+    function slugify(text) {
+        return text
+            .toLowerCase()
+            .trim()
+            .replace(/[^a-z0-9\s-]/g, '')
+            .replace(/\s+/g, '-')
+            .replace(/-+/g, '-');
+    }
+
+    function renderMarkdown(text) {
+        if (window.marked && window.DOMPurify) {
+            const raw = window.marked.parse(text || '', { breaks: true, gfm: true });
+            return window.DOMPurify.sanitize(raw);
+        }
+        return (text || '').replace(/[&<>"']/g, function(ch) {
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+            return map[ch] || ch;
+        });
+    }
+
+    function parseSSE(block) {
+        const lines = block.split('\n');
+        let type = 'message';
+        let data = '';
+
+        for (const line of lines) {
+            if (line.startsWith('event:')) {
+                type = line.replace('event:', '').trim();
+            } else if (line.startsWith('data:')) {
+                data += line.replace('data:', '').trim();
+            }
+        }
+
+        if (!data) return null;
+        try {
+            return { type, data: JSON.parse(data) };
+        } catch {
+            return null;
+        }
+
     }
 
     // Show typing indicator
