@@ -27,6 +27,7 @@ class Config:
         'RERANKER_MODEL',
         'hf.co/mradermacher/Qwen3-Reranker-4B-GGUF:Q4_K_M'
     )
+    OLLAMA_NUM_CTX = int(os.environ.get('OLLAMA_NUM_CTX', '32768'))
 
     # Groq settings for generation
     GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')

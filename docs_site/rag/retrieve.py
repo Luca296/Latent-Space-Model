@@ -49,7 +49,8 @@ def embed_query(query: str) -> List[float]:
     try:
         response = client.embeddings(
             model=Config.EMBEDDING_MODEL,
-            prompt=query
+            prompt=query,
+            options={'num_ctx': Config.OLLAMA_NUM_CTX}
         )
         return response['embedding']
     except Exception as e:

@@ -41,7 +41,7 @@ function initThemeToggle() {
  */
 function initChatbot() {
     const fab = document.getElementById('chatbot-toggle');
-    const panel = document.getElementById('chatbot-panel');
+    const sidebar = document.getElementById('chatbot-sidebar');
     const closeBtn = document.getElementById('chatbot-close');
     const input = document.getElementById('chat-input');
     const sendBtn = document.getElementById('chat-send');
@@ -52,20 +52,18 @@ function initChatbot() {
 
     // Open chatbot
     function openChatbot() {
-        fab.classList.add('hidden');
-        panel.classList.remove('hidden');
+        sidebar.classList.add('open');
         input.focus();
     }
 
     // Close chatbot
     function closeChatbot() {
-        panel.classList.add('hidden');
-        fab.classList.remove('hidden');
+        sidebar.classList.remove('open');
     }
 
     // Toggle chatbot panel
-    fab.addEventListener('click', openChatbot);
-    closeBtn.addEventListener('click', closeChatbot);
+    if (fab) fab.addEventListener('click', openChatbot);
+    if (closeBtn) closeBtn.addEventListener('click', closeChatbot);
 
     // Open chatbot from hero button
     if (askDocsBtn) {
@@ -91,7 +89,7 @@ function initChatbot() {
         if (!question) return;
 
         // Hide welcome message on first question
-        welcome.style.display = 'none';
+        if (welcome) welcome.style.display = 'none';
 
         // Add user message
         addMessage(question, 'user');

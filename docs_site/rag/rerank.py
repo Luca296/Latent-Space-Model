@@ -45,7 +45,7 @@ def rerank(query: str, candidates: List[dict], top_n: int = None) -> List[dict]:
             response = client.generate(
                 model=Config.RERANKER_MODEL,
                 prompt=prompt,
-                options={'temperature': 0.0, 'num_predict': 10}
+                options={'temperature': 0.0, 'num_predict': 10, 'num_ctx': Config.OLLAMA_NUM_CTX}
             )
 
             # Extract numeric score from response

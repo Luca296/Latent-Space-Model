@@ -34,7 +34,8 @@ def embed_chunks(chunks: List[Chunk], batch_size: int = 8) -> List[Tuple[Chunk, 
             try:
                 response = client.embeddings(
                     model=Config.EMBEDDING_MODEL,
-                    prompt=chunk.text
+                    prompt=chunk.text,
+                    options={'num_ctx': Config.OLLAMA_NUM_CTX}
                 )
 
                 if 'embedding' in response:
